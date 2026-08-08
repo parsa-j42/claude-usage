@@ -94,6 +94,20 @@ def test_org_discovery(mod):
     assert mod.discover_org_id({}) is None
 
 
+def test_org_discovery_prefers_subscription_over_api(mod):
+    """An account with both an api-only Console org and a chat/Max org must
+    pick the subscription org — the api-only one 403s on /usage."""
+    boot = {"account": {"memberships": [
+        {"organization": {"uuid": "API", "capabilities": ["api"]}},
+        {"organization": {"uuid": "MAX", "capabilities": ["chat", "claude_max"]}},
+    ]}}
+    # No cookie: fall back to capability ranking → the subscription org.
+    assert mod.discover_org_id(boot) == "MAX"
+    # lastActiveOrg cookie wins outright, even when it's the api org.
+    ck = "sessionKey=x; lastActiveOrg=API"
+    assert mod.discover_org_id(boot, ck) == "API"
+
+
 def test_org_resolution_precedence(mod):
     boot = {"account": {"memberships": [{"organization": {"uuid": "DISCOVERED"}}]}}
     assert mod.resolve_org("EXPLICIT", boot) == "EXPLICIT"  # explicit wins

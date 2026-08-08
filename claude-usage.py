@@ -159,17 +159,18 @@ def fmt_reset(iso):
     return f"{mins}m · {tstr}"
 
 # ── Cookie acquisition (Chrome/Chromium first) ────────────────────────
-def get_cookie(manual=None):
-    if manual:
-        return manual
+# claude.ai rotates sessionKey, cf_clearance and __cf_bm out from under a
+# long-running process. The browser always has the fresh values, so the dash
+# re-reads the cookie from Chrome on every fetch tick (see the main loop) and
+# immediately on a 401/403. That's what keeps it alive for days without a
+# manual re-login. read_chrome_cookie() is therefore loop-safe: it NEVER exits
+# and returns None on any failure so the caller can keep its last-known-good.
+def read_chrome_cookie():
+    """Current claude.ai cookie header from Chrome/Chromium, or None. No exits."""
     try:
         import browser_cookie3 as bc
     except ImportError:
-        sys.exit(
-            "Could not auto-read cookies. Either:\n"
-            "  pip install --user browser-cookie3\n"
-            "or pass manually:  ./claude-usage.py --cookie 'sessionKey=...'"
-        )
+        return None
     for loader in (bc.chrome, bc.chromium):
         try:
             cj = loader(domain_name="claude.ai")
@@ -178,6 +179,25 @@ def get_cookie(manual=None):
                 return "; ".join(f"{k}={v}" for k, v in cookies.items())
         except Exception:
             continue
+    return None
+
+def get_cookie(manual=None):
+    """Startup cookie resolve. Exits with a helpful message if nothing is found
+    — but only ever called once, before the loop. Inside the loop use
+    read_chrome_cookie() so a transient keyring/DB lock can't kill the dash."""
+    if manual:
+        return manual
+    ck = read_chrome_cookie()
+    if ck:
+        return ck
+    try:
+        import browser_cookie3  # noqa: F401
+    except ImportError:
+        sys.exit(
+            "Could not auto-read cookies. Either:\n"
+            "  pip install --user browser-cookie3\n"
+            "or pass manually:  ./claude-usage.py --cookie 'sessionKey=...'"
+        )
     sys.exit(
         "No Claude session cookie found in Chrome/Chromium.\n"
         "Make sure you're logged in, or pass --cookie manually.\n"
@@ -208,6 +228,9 @@ def get_cookie(manual=None):
 # ║    None on failure) so one dead endpoint never blanks the panel.       ║
 # ║ Known-good endpoints (all GET, cookie auth) as of 2026-07:             ║
 # ║   /api/organizations/<ORG>/usage            — limits/credits (core)    ║
+# ║      NB: 403 "Invalid authorization for organization" ≠ bad cookie —   ║
+# ║      it means <ORG> is the wrong org (e.g. an api-only Console org).    ║
+# ║      resolve_org() ranks by lastActiveOrg cookie + chat/claude_* caps.  ║
 # ║   /api/bootstrap                            — account/org/connectors   ║
 # ║   /v1/code/sessions?statuses=active&statuses=paused  — live sessions   ║
 # ║      (needs anthropic-version header)                                  ║
@@ -227,9 +250,25 @@ def COWORK_TASKS_URL(org):
 # Cloudflare binds the cf_clearance cookie to the exact User-Agent that earned
 # it. A generic "Mozilla/5.0" makes the clearance cookie invalid and claude.ai
 # answers the bot challenge page with 403 — which looks exactly like an expired
-# session but isn't. Keep this UA in step with the installed Chrome.
+# session but isn't. So we derive the UA's Chrome major from the *installed*
+# Chrome at runtime, rather than hardcoding a version that drifts on every
+# Chrome auto-update. Falls back to a recent literal if detection fails.
+def _detect_chrome_major():
+    import re, subprocess
+    for exe in ("google-chrome", "google-chrome-stable", "chromium",
+                "chromium-browser"):
+        try:
+            out = subprocess.run([exe, "--version"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            m = re.search(r"\b(\d+)\.\d+\.\d+", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            continue
+    return "151"  # keep in step with a recent Chrome as a last resort
+
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-       "Chrome/150.0.0.0 Safari/537.36")
+       f"Chrome/{_detect_chrome_major()}.0.0.0 Safari/537.36")
 _BASE_HEADERS = {
     "Accept": "application/json",
     "User-Agent": _UA,
@@ -268,20 +307,45 @@ def fetch_bootstrap(cookie):
     fetched once at startup. Best-effort — None on failure so the panel omits it."""
     return fetch_json(BOOTSTRAP_URL, cookie)
 
-def discover_org_id(boot):
-    """Pull the organization UUID out of a /api/bootstrap payload. Walks the
-    same account.memberships[].organization path the ACCOUNT panel reads, and
-    accepts either `uuid` or `id` since the field name has drifted historically.
+def _cookie_value(cookie, name):
+    """Pluck a single cookie value out of the joined 'k=v; k=v' header."""
+    for part in (cookie or "").split("; "):
+        if part.startswith(name + "="):
+            return part[len(name) + 1:]
+    return None
+
+def discover_org_id(boot, cookie=None):
+    """Pick the organization UUID to query from a /api/bootstrap payload.
+
+    An account often has MORE than one membership — e.g. a chat/Max
+    subscription org AND an `api`-only Console org. The /usage endpoint only
+    authorizes the subscription org; querying the api-only one returns
+    403 'Invalid authorization for organization', which used to masquerade as
+    an expired cookie. So don't just grab the first membership — rank them:
+      1. the org matching the `lastActiveOrg` cookie (what the browser uses),
+      2. an org whose capabilities include chat/claude_* over an api-only org,
+      3. otherwise the first membership.
+    Accepts either `uuid` or `id` since the field name has drifted historically.
     Returns None if bootstrap is absent or carries no membership."""
     account = (boot or {}).get("account") or {}
+    orgs = []
     for membership in account.get("memberships") or []:
         org = membership.get("organization") or {}
         org_id = org.get("uuid") or org.get("id")
         if org_id:
+            orgs.append((org_id, org.get("capabilities") or []))
+    if not orgs:
+        return None
+    active = _cookie_value(cookie, "lastActiveOrg")
+    for org_id, _ in orgs:
+        if org_id == active:
             return org_id
-    return None
+    for org_id, caps in orgs:
+        if any(c == "chat" or c.startswith("claude_") for c in caps):
+            return org_id
+    return orgs[0][0]
 
-def resolve_org(explicit, boot):
+def resolve_org(explicit, boot, cookie=None):
     """Decide which organization to query, most-trusted source first:
     explicit --org / $CLAUDE_ORG_ID, then discovery from bootstrap. Exits with
     an actionable message if none is available — the usage URL can't be built
@@ -289,7 +353,7 @@ def resolve_org(explicit, boot):
     works when bootstrap is down, as long as the org is supplied."""
     if explicit:
         return explicit
-    org = discover_org_id(boot)
+    org = discover_org_id(boot, cookie)
     if org:
         return org
     sys.exit(
@@ -953,7 +1017,7 @@ def main():
     cookie = get_cookie(args.cookie)
     global BOOT, LIVE
     BOOT = fetch_bootstrap(cookie)  # account/org config for the big panel
-    org = resolve_org(args.org, BOOT)
+    org = resolve_org(args.org, BOOT, cookie)
     cache, err = None, None
     last_fetch = last_extra = last_boot = 0.0
     last_buf, force = "", True
@@ -971,18 +1035,45 @@ def main():
             now = time.time()
             # Core usage — the fast clock (also refreshed on manual [r]/force).
             if force or now - last_fetch >= args.interval:
+                # Re-sync the cookie from Chrome first: claude.ai rotates
+                # sessionKey/cf_clearance/__cf_bm periodically, and the browser
+                # holds the fresh values. Skipped when a manual cookie is set.
+                if not args.cookie:
+                    fresh = read_chrome_cookie()
+                    if fresh:
+                        cookie = fresh
                 try:
                     cache, err = fetch(cookie, org), None
                 except requests.HTTPError as e:
                     code = e.response.status_code
                     body = (e.response.text or "")[:400]
-                    if code == 403 and "Just a moment" in body:
+                    hdrs = e.response.headers
+                    cf_challenge = code == 403 and (
+                        e.response.headers.get("cf-mitigated") == "challenge"
+                        or "Just a moment" in body
+                        or "Enable JavaScript and cookies" in body
+                        or (bool(hdrs.get("cf-ray"))
+                            and "cloudflare" in hdrs.get("Server", "").lower()
+                            and not body.lstrip().startswith("{")))
+                    if code in (401, 403):
+                        # Cookie may have just rotated in Chrome — re-read and
+                        # retry once before surfacing an error to the user.
+                        if not args.cookie:
+                            fresh = read_chrome_cookie()
+                            if fresh and fresh != cookie:
+                                cookie = fresh
+                                try:
+                                    cache, err = fetch(cookie, org), None
+                                    last_extra = 0  # re-pull extras w/ new cookie
+                                except Exception:
+                                    pass
+                    if cf_challenge:
                         # Cloudflare challenge, not an auth problem: the
                         # cf_clearance cookie is stale or _UA no longer matches
                         # the Chrome that earned it.
                         err = ("Cloudflare challenge (403).\nLoad claude.ai in "
-                               "Chrome once to refresh cf_clearance, and check "
-                               "_UA matches your Chrome version.")
+                               "Chrome once to refresh cf_clearance "
+                               "(UA is auto-detected from your Chrome).")
                     elif code in (401, 403):
                         err = f"Auth failed ({code}).\nRe-login in Chrome — cookie expired."
                     else:
