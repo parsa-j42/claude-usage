@@ -12,20 +12,23 @@ Two things are checked:
 Run:  python3 tests/test_usage.py
 No third-party test runner needed.
 """
-import importlib.util
 import os
 import sys
 from datetime import datetime, timezone
 
+# The runtime is now an importable module (claude_usage.py). Ensure the repo
+# root is on sys.path so `import claude_usage` works whether or not the package
+# is pip-installed.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SCRIPT = os.path.join(_HERE, os.pardir, "claude-usage.py")
+sys.path.insert(0, os.path.join(_HERE, os.pardir))
 
 
 def load_module():
-    """Import the hyphenated script as a module and freeze its clock."""
-    spec = importlib.util.spec_from_file_location("claude_usage", _SCRIPT)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    """Import the module fresh and freeze its clock."""
+    import importlib
+
+    import claude_usage as mod
+    importlib.reload(mod)
 
     fixed = datetime(2026, 8, 7, 14, 30, 15, tzinfo=timezone.utc)
 

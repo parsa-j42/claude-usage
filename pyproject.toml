@@ -17,11 +17,12 @@ dependencies = [
 cookies = ["browser-cookie3>=0.19"]
 dev = ["pytest>=7"]
 
-# The script is a single hyphenated file (claude-usage.py) at the repo root and
-# is not yet importable-by-name; there is intentionally no [project.scripts]
-# entry point until Phase 2. `pip install -e .` still installs the deps.
+# Single-module package: the runtime lives in claude_usage.py at the repo root.
+[project.scripts]
+claude-usage = "claude_usage:main"
+
 [tool.setuptools]
-py-modules = []
+py-modules = ["claude_usage"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

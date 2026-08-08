@@ -11,10 +11,10 @@ credits/spend, extra usage, plus account, connectors/MCP and cowork status
 Keys:  r / space — refresh now      q / Ctrl-C — quit
 
 Run:
-  ./claude-usage.py            # live dashboard, refresh every 2 min
-  ./claude-usage.py -n 30      # refresh every 30s
-  ./claude-usage.py --cookie 'sessionKey=...'   # manual cookie fallback
-  ./claude-usage.py --org <uuid>                # pin the organization
+  claude-usage            # live dashboard, refresh every 2 min
+  claude-usage -n 30      # refresh every 30s
+  claude-usage --cookie 'sessionKey=...'   # manual cookie fallback
+  claude-usage --org <uuid>                # pin the organization
 
 Setup:
   pip install --user requests browser-cookie3
@@ -196,7 +196,7 @@ def get_cookie(manual=None):
         sys.exit(
             "Could not auto-read cookies. Either:\n"
             "  pip install --user browser-cookie3\n"
-            "or pass manually:  ./claude-usage.py --cookie 'sessionKey=...'"
+            "or pass manually:  claude-usage --cookie 'sessionKey=...'"
         )
     sys.exit(
         "No Claude session cookie found in Chrome/Chromium.\n"
@@ -359,7 +359,7 @@ def resolve_org(explicit, boot, cookie=None):
     sys.exit(
         "Could not determine your organization ID.\n"
         "Bootstrap was unreachable or returned no membership. Pass it manually:\n"
-        "  ./claude-usage.py --org <uuid>\n"
+        "  claude-usage --org <uuid>\n"
         "or set CLAUDE_ORG_ID. Find it in claude.ai DevTools → Network → any\n"
         "/api/organizations/<uuid>/... request.")
 

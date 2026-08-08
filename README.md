@@ -44,19 +44,29 @@ with your existing browser session cookie — no API key, nothing to configure.
 
 Requires Python 3.9+.
 
+Install as a command with [pipx](https://pipx.pypa.io):
+
 ```bash
-pip install --user -r requirements.txt
-# or just the essentials:
-pip install --user requests browser-cookie3
+pipx install git+https://github.com/parsa-j42/claude-usage
+# or from a local checkout:
+pipx install .
 ```
 
-`browser-cookie3` is optional; without it, supply the cookie manually (below).
+This puts a `claude-usage` command on your PATH. To also read cookies from the
+browser automatically, install the optional extra:
+
+```bash
+pipx install "claude-usage[cookies] @ git+https://github.com/parsa-j42/claude-usage"
+```
+
+`browser-cookie3` (the `cookies` extra) is optional; without it, supply the
+cookie manually (below).
 
 ## Usage
 
 ```bash
-./claude-usage.py              # live dashboard, refresh every 2 min
-./claude-usage.py -n 30        # refresh core usage every 30s
+claude-usage              # live dashboard, refresh every 2 min
+claude-usage -n 30        # refresh core usage every 30s
 ```
 
 Keys, while running:
@@ -85,7 +95,7 @@ The tool needs your logged-in `claude.ai` session cookie.
    it or use the manual path.
 2. **Manual.** Copy the `sessionKey` cookie from DevTools and pass it:
    ```bash
-   ./claude-usage.py --cookie 'sessionKey=sk-ant-...'
+   claude-usage --cookie 'sessionKey=sk-ant-...'
    ```
 
 Your cookie is used only to call `claude.ai` directly. Nothing is stored or sent
@@ -98,7 +108,7 @@ UUID. It is **discovered automatically** from `/api/bootstrap` — normally you
 never touch this. To pin it explicitly (or if bootstrap is unreachable):
 
 ```bash
-./claude-usage.py --org <uuid>
+claude-usage --org <uuid>
 # or
 export CLAUDE_ORG_ID=<uuid>
 ```
