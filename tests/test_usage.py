@@ -140,6 +140,84 @@ def test_usage_url(mod):
     assert mod.usage_url("ABC") == "https://claude.ai/api/organizations/ABC/usage"
 
 
+# ── Phase 3: config file + setting precedence ─────────────────────────
+
+def test_resolve_setting_precedence(mod):
+    r = mod.resolve_setting
+    assert r("cli", "env", "cfg", "def") == "cli"    # CLI wins
+    assert r(None, "env", "cfg", "def") == "env"     # then env
+    assert r(None, None, "cfg", "def") == "cfg"      # then config
+    assert r(None, None, None, "def") == "def"       # then default
+    # `is not None`, not truthiness: an explicit 0 must beat a later source.
+    assert r(0, None, 300, 999) == 0
+    assert r(None, None, 0, 999) == 0
+
+
+def test_runtime_config_full_precedence(mod):
+    rc = mod.resolve_runtime_config
+    # Every source empty → built-in defaults.
+    d = rc({}, {}, {})
+    assert d == {"interval": 120, "extras_interval": 300,
+                 "bootstrap_interval": 0, "org": None, "cookie_source": "auto"}
+    # CLI beats env beats config, field by field.
+    cli = {"interval": 10, "org": "CLI"}
+    env = {"interval": 20, "org": "ENV", "cookie_source": "firefox"}
+    cfg = {"interval": 30, "org": "CFG", "cookie_source": "chrome",
+           "bootstrap_interval": 45}
+    out = rc(cli, env, cfg)
+    assert out["interval"] == 10           # CLI
+    assert out["org"] == "CLI"             # CLI
+    assert out["cookie_source"] == "firefox"  # env (no CLI)
+    assert out["bootstrap_interval"] == 45    # config (no CLI/env)
+    # Full fall-through table for org and cookie_source (not just CLI wins).
+    assert rc({}, {"org": "ENV"}, {"org": "CFG"})["org"] == "ENV"
+    assert rc({}, {}, {"org": "CFG"})["org"] == "CFG"
+    assert rc({}, {}, {"cookie_source": "chrome"})["cookie_source"] == "chrome"
+
+
+def test_runtime_config_zero_beats_config(mod):
+    """An explicit --bootstrap-interval 0 must not be overridden by config."""
+    out = mod.resolve_runtime_config(
+        {"bootstrap_interval": 0}, {}, {"bootstrap_interval": 300})
+    assert out["bootstrap_interval"] == 0
+
+
+def test_runtime_config_coerces_and_validates(mod):
+    rc = mod.resolve_runtime_config
+    # String ints from env/config are coerced; garbage falls through to default.
+    assert rc({}, {"interval": "30"}, {})["interval"] == 30
+    assert rc({}, {}, {"interval": "not-a-number"})["interval"] == 120
+    # extras_interval is floored at interval (a big -n implies laziness).
+    assert rc({"interval": 500}, {}, {"extras_interval": 100})["extras_interval"] == 500
+    # An unknown cookie-source is rejected back to 'auto'.
+    assert rc({"cookie_source": "safari"}, {}, {})["cookie_source"] == "auto"
+
+
+def test_load_config(mod):
+    import tempfile
+    # A well-formed file parses to a dict.
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write('interval = 42\ncookie_source = "firefox"\n')
+        good = f.name
+    try:
+        # The env-marked `tomli` dep guarantees a parser on every supported
+        # Python, so this is a hard gate — it's what makes the 3.9 CI leg prove
+        # the backport (and the dependency marker) actually resolve.
+        assert mod._toml is not None, "no TOML parser — check the tomli marker"
+        assert mod.load_config(good) == {"interval": 42, "cookie_source": "firefox"}
+    finally:
+        os.unlink(good)
+    # Missing file and malformed content both degrade to {}.
+    assert mod.load_config(os.path.join(_HERE, "does-not-exist.toml")) == {}
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("this is = = not valid toml\n")
+        bad = f.name
+    try:
+        assert mod.load_config(bad) == {}
+    finally:
+        os.unlink(bad)
+
+
 def main():
     mod = load_module()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

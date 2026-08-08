@@ -84,19 +84,51 @@ Keys, while running:
 | `--extras-interval`    | `300`   | Refresh interval for panel extras (sessions, chats).|
 | `--bootstrap-interval` | `0`     | Re-fetch account/org config every N s (0 = once).   |
 | `--cookie`             | —       | Session cookie, e.g. `'sessionKey=...'`.            |
+| `--cookie-source`      | `auto`  | Read cookies from `chrome`, `firefox`, or `auto`.   |
 | `--org`                | —       | Organization UUID (see below).                      |
+
+## Configuration
+
+Every setting except `--cookie` (a secret, never read from disk) can be set in a
+config file so you don't retype it. Values are resolved with this precedence:
+
+**CLI flag → environment variable → config file → built-in default.**
+
+The config file lives at `$XDG_CONFIG_HOME/claude-usage/config.toml` (i.e.
+`~/.config/claude-usage/config.toml`). Keys mirror the flag names with
+underscores:
+
+```toml
+# ~/.config/claude-usage/config.toml
+interval = 60
+extras_interval = 300
+bootstrap_interval = 0
+cookie_source = "firefox"
+org = "your-org-uuid"
+```
+
+Matching environment variables: `CLAUDE_USAGE_INTERVAL`,
+`CLAUDE_USAGE_EXTRAS_INTERVAL`, `CLAUDE_USAGE_BOOTSTRAP_INTERVAL`,
+`CLAUDE_USAGE_COOKIE_SOURCE`, and `CLAUDE_ORG_ID` (for `org`).
 
 ## Authentication
 
 The tool needs your logged-in `claude.ai` session cookie.
 
 1. **Automatic (default).** With `browser-cookie3` installed, the cookie is read
-   from Chrome/Chromium. If your keyring is locked, decryption can fail — unlock
-   it or use the manual path.
+   from your browser — Chrome/Chromium first, then Firefox (`--cookie-source`
+   pins one). If your keyring is locked, decryption can fail — unlock it or use
+   the manual path.
 2. **Manual.** Copy the `sessionKey` cookie from DevTools and pass it:
    ```bash
    claude-usage --cookie 'sessionKey=sk-ant-...'
    ```
+
+> **Firefox note:** the outbound request uses a Chrome User-Agent (Cloudflare
+> binds its `cf_clearance` cookie to the UA that earned it). A Firefox-sourced
+> `sessionKey` generally works, but a Firefox `cf_clearance` may still trigger a
+> Cloudflare challenge. If you hit one, load `claude.ai` in Chrome once, or use
+> `--cookie` manually.
 
 Your cookie is used only to call `claude.ai` directly. Nothing is stored or sent
 anywhere else.
