@@ -38,6 +38,19 @@ def load_module():
     return mod
 
 
+# When run under pytest, expose the loaded+frozen module as a `mod` fixture so
+# the existing `test_*(mod)` functions are collected as-is. The standalone
+# `python3 tests/test_usage.py` path (see main()) still injects `mod` itself.
+try:
+    import pytest
+
+    @pytest.fixture
+    def mod():
+        return load_module()
+except ImportError:  # pytest not installed — the __main__ path still works.
+    pass
+
+
 # A fixture broad enough to light up every panel section and both the
 # normalized `limits` array and the legacy five_hour/seven_day fallback.
 DATA = {

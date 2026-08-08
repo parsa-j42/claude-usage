@@ -123,7 +123,9 @@ easy to reason about and test.
 ## Development
 
 ```bash
-python3 tests/test_usage.py     # render regression + org-resolution tests
+pip install -e ".[dev]"         # install with dev deps (pytest)
+pytest -q                        # run the test suite
+python3 tests/test_usage.py     # or run the same tests without pytest
 ```
 
 The tests render a fixed fixture across the full size matrix under a frozen
