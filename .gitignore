@@ -8,8 +8,10 @@ __pycache__/
 venv/
 env/
 
-# Local Claude Code settings (may hold machine-specific paths/permissions)
-.claude/settings.local.json
+# Claude Code: keep ALL local instruction/planning files off GitHub.
+# The roadmap, phase docs, ledger, and any CLAUDE.md live under .claude/
+# and are intentionally never pushed.
+.claude/
 
 # Editor / OS cruft
 .DS_Store
