@@ -1,6 +1,0 @@
-# Core HTTP client — required.
-requests>=2.28
-
-# Optional: auto-reads the claude.ai session cookie from Chrome/Chromium.
-# Without it, pass the cookie manually via --cookie 'sessionKey=...'.
-browser-cookie3>=0.19

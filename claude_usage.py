@@ -39,6 +39,17 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install --user requests")
 
+# TOML config parsing: stdlib `tomllib` on 3.11+, the `tomli` backport below.
+# The 3.9/3.10 CI leg is what proves this shim (and the dep marker) actually
+# work. Absent even the backport, config support degrades to "no config file".
+try:
+    import tomllib as _toml
+except ModuleNotFoundError:  # 3.9 / 3.10
+    try:
+        import tomli as _toml  # type: ignore
+    except ModuleNotFoundError:
+        _toml = None
+
 
 def usage_url(org: str) -> str:
     """The core limits/credits endpoint for an organization."""
@@ -158,20 +169,42 @@ def fmt_reset(iso):
         return f"{hrs}h {mins % 60}m · {tstr}"
     return f"{mins}m · {tstr}"
 
-# ── Cookie acquisition (Chrome/Chromium first) ────────────────────────
+# ── Cookie acquisition ────────────────────────────────────────────────
 # claude.ai rotates sessionKey, cf_clearance and __cf_bm out from under a
 # long-running process. The browser always has the fresh values, so the dash
-# re-reads the cookie from Chrome on every fetch tick (see the main loop) and
-# immediately on a 401/403. That's what keeps it alive for days without a
-# manual re-login. read_chrome_cookie() is therefore loop-safe: it NEVER exits
+# re-reads the cookie from the browser on every fetch tick (see the main loop)
+# and immediately on a 401/403. That's what keeps it alive for days without a
+# manual re-login. read_browser_cookie() is therefore loop-safe: it NEVER exits
 # and returns None on any failure so the caller can keep its last-known-good.
-def read_chrome_cookie():
-    """Current claude.ai cookie header from Chrome/Chromium, or None. No exits."""
+#
+# Source selection (`--cookie-source`):
+#   auto     — try Chrome/Chromium, then Firefox (default)
+#   chrome   — Chrome/Chromium only
+#   firefox  — Firefox only
+# NOTE: the outbound User-Agent is a Chrome UA (see _UA); Cloudflare binds
+# cf_clearance to that UA, so a Firefox-sourced cf_clearance can still draw a
+# challenge. sessionKey-only access generally works; see the ledger (D-06).
+COOKIE_SOURCES = ("auto", "chrome", "firefox")
+
+
+def _cookie_loaders(source):
+    """browser_cookie3 loader callables for a source, or None if unavailable."""
     try:
         import browser_cookie3 as bc
     except ImportError:
         return None
-    for loader in (bc.chrome, bc.chromium):
+    chrome = (bc.chrome, bc.chromium)
+    firefox = (bc.firefox,)
+    return {"auto": chrome + firefox, "chrome": chrome,
+            "firefox": firefox}.get(source, chrome + firefox)
+
+
+def read_browser_cookie(source="auto"):
+    """Current claude.ai cookie header from the browser, or None. No exits."""
+    loaders = _cookie_loaders(source)
+    if not loaders:
+        return None
+    for loader in loaders:
         try:
             cj = loader(domain_name="claude.ai")
             cookies = {c.name: c.value for c in cj}
@@ -181,13 +214,13 @@ def read_chrome_cookie():
             continue
     return None
 
-def get_cookie(manual=None):
+def get_cookie(manual=None, source="auto"):
     """Startup cookie resolve. Exits with a helpful message if nothing is found
     — but only ever called once, before the loop. Inside the loop use
-    read_chrome_cookie() so a transient keyring/DB lock can't kill the dash."""
+    read_browser_cookie() so a transient keyring/DB lock can't kill the dash."""
     if manual:
         return manual
-    ck = read_chrome_cookie()
+    ck = read_browser_cookie(source)
     if ck:
         return ck
     try:
@@ -198,11 +231,94 @@ def get_cookie(manual=None):
             "  pip install --user browser-cookie3\n"
             "or pass manually:  claude-usage --cookie 'sessionKey=...'"
         )
+    where = {"chrome": "Chrome/Chromium", "firefox": "Firefox"}.get(
+        source, "Chrome/Chromium or Firefox")
     sys.exit(
-        "No Claude session cookie found in Chrome/Chromium.\n"
+        f"No Claude session cookie found in {where}.\n"
         "Make sure you're logged in, or pass --cookie manually.\n"
         "(If your keyring is locked, that can block cookie decryption.)"
     )
+
+
+# ── Config file + setting precedence ──────────────────────────────────
+# Config lives at $XDG_CONFIG_HOME/claude-usage/config.toml (default
+# ~/.config/...). Keys mirror the CLI flags EXCEPT --cookie: a session cookie
+# is a secret and is never read from, or written to, the config file (D-05).
+# Precedence for every setting: CLI flag > env var > config file > default.
+def config_path():
+    """Path to the TOML config file (XDG-aware). Read at call time, not import."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return os.path.join(base, "claude-usage", "config.toml")
+
+
+def load_config(path=None):
+    """Parse the TOML config into a dict. Best-effort: a missing file, a parse
+    error, or no TOML parser available all yield {} rather than raising —
+    config is a convenience, never a hard dependency."""
+    if _toml is None:
+        return {}
+    path = path or config_path()
+    try:
+        with open(path, "rb") as fh:
+            data = _toml.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+
+def _coerce_int(value):
+    """Best-effort int, or None for missing/garbage (so precedence falls
+    through instead of crashing the loop on a string like '30')."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_setting(cli, env, cfg, default):
+    """First non-None of (cli, env, cfg), else default. `is not None` (not
+    truthiness) so a meaningful 0 — e.g. --bootstrap-interval 0 — wins over a
+    config value instead of being treated as 'unset'."""
+    for v in (cli, env, cfg):
+        if v is not None:
+            return v
+    return default
+
+
+def resolve_runtime_config(cli, env, cfg):
+    """Pure resolver for every runtime setting. `cli`/`env`/`cfg` are plain
+    dicts; returns the fully-resolved settings dict that main() binds locals
+    from. Kept pure and side-effect-free so the whole precedence table is
+    unit-tested offline without invoking main() or touching argparse/os.environ.
+
+    Ints are coerced at the env/config boundary (env vars and TOML values may
+    arrive as strings); cookie-source is validated against COOKIE_SOURCES with
+    an 'auto' fallback so a stray config/env value can't wedge the reader."""
+    def i(key, default):
+        return resolve_setting(_coerce_int(cli.get(key)),
+                               _coerce_int(env.get(key)),
+                               _coerce_int(cfg.get(key)), default)
+
+    interval = i("interval", 120)
+    extras_interval = i("extras_interval", 300)
+    bootstrap_interval = i("bootstrap_interval", 0)
+    org = resolve_setting(cli.get("org"), env.get("org"), cfg.get("org"), None)
+    source = resolve_setting(cli.get("cookie_source"), env.get("cookie_source"),
+                             cfg.get("cookie_source"), "auto")
+    if source not in COOKIE_SOURCES:
+        source = "auto"
+    return {
+        "interval": interval,
+        # Never poll extras faster than the core clock — a big -n implies
+        # laziness. (Preserves the pre-config behavior.)
+        "extras_interval": max(extras_interval, interval),
+        "bootstrap_interval": bootstrap_interval,
+        "org": org,
+        "cookie_source": source,
+    }
 
 # ── Endpoints ─────────────────────────────────────────────────────────
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -997,27 +1113,44 @@ def draw(lines, last):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-n", "--interval", type=int, default=120,
-                    help="core usage refresh seconds (limits/credits)")
+    # Flag defaults are None so the resolver can tell "unset" from an explicit
+    # value; the real defaults live in resolve_runtime_config().
+    ap.add_argument("-n", "--interval", type=int, default=None,
+                    help="core usage refresh seconds (limits/credits) [120]")
     # Panel extras change slowly, so they poll on a lazier clock by default.
-    ap.add_argument("--extras-interval", type=int, default=300,
+    ap.add_argument("--extras-interval", type=int, default=None,
                     help="refresh seconds for live extras (sessions, chats, "
-                         "cowork) — the big-panel data (default 300)")
-    ap.add_argument("--bootstrap-interval", type=int, default=0,
+                         "cowork) — the big-panel data [300]")
+    ap.add_argument("--bootstrap-interval", type=int, default=None,
                     help="re-fetch account/org config every N seconds "
-                         "(default 0 = only once at startup)")
+                         "[0 = only once at startup]")
     ap.add_argument("--cookie", help="paste 'sessionKey=...' manually")
-    ap.add_argument("--org", default=os.environ.get("CLAUDE_ORG_ID"),
-                    help="organization UUID (default: $CLAUDE_ORG_ID, else "
-                         "auto-discovered from /api/bootstrap)")
+    ap.add_argument("--cookie-source", choices=COOKIE_SOURCES, default=None,
+                    help="which browser to read cookies from [auto]")
+    ap.add_argument("--org", default=None,
+                    help="organization UUID (default: auto-discovered from "
+                         "/api/bootstrap)")
     args = ap.parse_args()
-    # Never poll extras faster than the core clock — a big -n implies laziness.
-    extras_interval = max(args.extras_interval, args.interval)
 
-    cookie = get_cookie(args.cookie)
+    # Precedence: CLI flag > env var > config file > built-in default.
+    cli = {"interval": args.interval, "extras_interval": args.extras_interval,
+           "bootstrap_interval": args.bootstrap_interval, "org": args.org,
+           "cookie_source": args.cookie_source}
+    env = {"interval": os.environ.get("CLAUDE_USAGE_INTERVAL"),
+           "extras_interval": os.environ.get("CLAUDE_USAGE_EXTRAS_INTERVAL"),
+           "bootstrap_interval": os.environ.get("CLAUDE_USAGE_BOOTSTRAP_INTERVAL"),
+           "org": os.environ.get("CLAUDE_ORG_ID"),
+           "cookie_source": os.environ.get("CLAUDE_USAGE_COOKIE_SOURCE")}
+    cfg = resolve_runtime_config(cli, env, load_config())
+    interval = cfg["interval"]
+    extras_interval = cfg["extras_interval"]
+    bootstrap_interval = cfg["bootstrap_interval"]
+    cookie_source = cfg["cookie_source"]
+
+    cookie = get_cookie(args.cookie, cookie_source)
     global BOOT, LIVE
     BOOT = fetch_bootstrap(cookie)  # account/org config for the big panel
-    org = resolve_org(args.org, BOOT, cookie)
+    org = resolve_org(cfg["org"], BOOT, cookie)
     cache, err = None, None
     last_fetch = last_extra = last_boot = 0.0
     last_buf, force = "", True
@@ -1034,12 +1167,12 @@ def main():
         while True:
             now = time.time()
             # Core usage — the fast clock (also refreshed on manual [r]/force).
-            if force or now - last_fetch >= args.interval:
-                # Re-sync the cookie from Chrome first: claude.ai rotates
+            if force or now - last_fetch >= interval:
+                # Re-sync the cookie from the browser first: claude.ai rotates
                 # sessionKey/cf_clearance/__cf_bm periodically, and the browser
                 # holds the fresh values. Skipped when a manual cookie is set.
                 if not args.cookie:
-                    fresh = read_chrome_cookie()
+                    fresh = read_browser_cookie(cookie_source)
                     if fresh:
                         cookie = fresh
                 try:
@@ -1059,7 +1192,7 @@ def main():
                         # Cookie may have just rotated in Chrome — re-read and
                         # retry once before surfacing an error to the user.
                         if not args.cookie:
-                            fresh = read_chrome_cookie()
+                            fresh = read_browser_cookie(cookie_source)
                             if fresh and fresh != cookie:
                                 cookie = fresh
                                 try:
@@ -1075,7 +1208,7 @@ def main():
                                "Chrome once to refresh cf_clearance "
                                "(UA is auto-detected from your Chrome).")
                     elif code in (401, 403):
-                        err = f"Auth failed ({code}).\nRe-login in Chrome — cookie expired."
+                        err = f"Auth failed ({code}).\nRe-login in your browser — cookie expired."
                     else:
                         err = f"HTTP {code}"
                 except Exception as e:
@@ -1086,7 +1219,7 @@ def main():
                 LIVE = fetch_live(cookie, org)  # best-effort; may hold Nones
                 last_extra = now
             # Bootstrap — once at startup unless a refresh interval was set.
-            if args.bootstrap_interval and now - last_boot >= args.bootstrap_interval:
+            if bootstrap_interval and now - last_boot >= bootstrap_interval:
                 BOOT = fetch_bootstrap(cookie) or BOOT
                 last_boot = now
             force = False
@@ -1094,7 +1227,7 @@ def main():
             mdef = primary_metrics(cache) if cache else []
             cols, rows = shutil.get_terminal_size((80, 24))
             lines = (error_lines(err, cols, rows) if err
-                     else render(cache, cols, rows, args.interval, mdef))
+                     else render(cache, cols, rows, interval, mdef))
             last_buf = draw(lines, last_buf)
 
             if is_tty:

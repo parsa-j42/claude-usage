@@ -11,6 +11,8 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
     "requests>=2.28",
+    # TOML config parsing; stdlib `tomllib` covers 3.11+.
+    "tomli>=1.1.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
