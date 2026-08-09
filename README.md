@@ -116,6 +116,23 @@ Persistence is on by default; disable it with `--no-persist` (or `persist =
 false` in config). This history file is the foundation for the trends and
 alerting features that follow.
 
+### Trend sparklines
+
+In the full panel layout (large windows), each limit gets a small block-glyph
+`trend` sparkline under its bar — the last several readings of that limit's
+usage percentage, on a fixed 0–100 scale:
+
+```
+5-hour    ██████████████▊░░░░░░░░░░░░   60%
+          ⭮ 3h
+          trend ▂▂▃▅▄▅
+```
+
+Trends are seeded from the history file at startup (so prior runs and cron
+`--once` samples show up right away) and fill in further as the dashboard runs.
+They appear only in the full panel; smaller layouts show bars alone. The trend
+buffer works even with `--no-persist` (it just isn't written to disk).
+
 ## Configuration
 
 Every setting except `--cookie` (a secret, never read from disk) can be set in a

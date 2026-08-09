@@ -337,6 +337,101 @@ def test_run_once_snapshot_error_is_clean(mod):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ── Phase 5: trends & sparklines ──────────────────────────────────────
+
+# History whose 5-hour/7-day labels match DATA's limit labels, so the panel can
+# draw a trend line for each.
+HISTORY = [
+    {"ts": f"2026-08-07T1{i}:00:00+00:00",
+     "limits": [{"label": "5-hour", "pct": p, "resets_at": None},
+                {"label": "7-day", "pct": p / 2, "resets_at": None}],
+     "spend": {}}
+    for i, p in enumerate((0, 14, 28, 42, 57, 71, 85, 100))
+]
+
+
+def test_sparkline_exact(mod):
+    # Fixed 0–100 scale maps evenly across the eight glyphs.
+    assert mod.sparkline([0, 14, 28, 42, 57, 71, 85, 100]) == "▁▂▃▄▅▆▇█"
+    # Clamping out-of-range, dropping non-numbers, and the empty case.
+    assert mod.sparkline([-10, 200, 50]) == "▁█▅"
+    assert mod.sparkline([]) == ""
+    assert mod.sparkline([True, "x", None, 50]) == "▅"  # bool/str/None dropped
+    # width keeps only the most recent samples.
+    assert mod.sparkline([0, 0, 0, 100], width=2) == "▁█"
+
+
+def test_trend_series(mod):
+    assert mod.trend_series(HISTORY, "5-hour") == [0, 14, 28, 42, 57, 71, 85, 100]
+    assert mod.trend_series(HISTORY, "7-day", n=3) == [35.5, 42.5, 50.0]  # last 3
+    assert mod.trend_series(HISTORY, "nonexistent") == []
+    assert mod.trend_series(None, "5-hour") == []
+
+
+def test_history_index(mod):
+    idx = mod.history_index(HISTORY)
+    assert set(idx) == {"5-hour", "7-day"}
+    assert idx["5-hour"] == [0, 14, 28, 42, 57, 71, 85, 100]
+    assert mod.history_index(None) == {}
+    # Non-numeric / bool pcts and unlabeled entries are dropped.
+    assert mod.history_index([{"limits": [
+        {"label": "x", "pct": True}, {"label": None, "pct": 5},
+        {"label": "x", "pct": 5}]}]) == {"x": [5.0]}
+
+
+def test_panel_trend_line_fits_width(mod):
+    """With a long history the trend line must never exceed the panel width (a
+    16-col prefix + capped glyphs), or it wraps and breaks the fixed layout."""
+    long_hist = [{"limits": [{"label": "5-hour", "pct": (i * 7) % 100},
+                             {"label": "7-day", "pct": (i * 3) % 100}]}
+                 for i in range(60)]  # more than any width would show
+    mdef = mod.primary_metrics(DATA)
+    for cols in (46, 60, 100):
+        lines = _strip(mod.render(DATA, cols, 40, 120, mdef, long_hist))
+        assert max(len(l) for l in lines) <= cols, f"overflow at cols={cols}"
+        assert any(l.strip().startswith("trend ") for l in lines)
+
+
+def _strip(lines):
+    import re
+    return [re.sub(r"\033\[[0-9;]*m", "", l) for l in lines]
+
+
+def test_panel_shows_sparkline(mod):
+    """The big layout gains a `trend` line (with block glyphs) once ≥2 samples
+    exist; output is identical across calls (deterministic)."""
+    mdef = mod.primary_metrics(DATA)
+    lines = mod.render(DATA, 100, 40, 120, mdef, HISTORY)
+    trend_lines = [l for l in _strip(lines) if l.strip().startswith("trend ")]
+    assert trend_lines, "no trend line in the panel"
+    # The glyphs after the marker must be sparkline blocks.
+    glyphs = trend_lines[0].strip()[len("trend "):]
+    assert glyphs and all(g in mod._SPARK_GLYPHS for g in glyphs)
+    assert mod.render(DATA, 100, 40, 120, mdef, HISTORY) == lines  # stable
+
+
+def test_small_layouts_have_no_sparkline(mod):
+    """Sparklines are panel-only. The `trend` marker (which the full block █ in
+    a progress bar could otherwise be confused with) must be absent, and each
+    layout still emits exactly `rows` lines."""
+    mdef = mod.primary_metrics(DATA)
+    for cols, rows in [(40, 5), (45, 20), (22, 12), (40, 1)]:
+        lines = mod.render(DATA, cols, rows, 120, mdef, HISTORY)
+        plain = "\n".join(_strip(lines))
+        assert "trend " not in plain, f"{cols}x{rows}"
+        assert len(lines) == rows
+
+
+def test_panel_no_history_is_graceful(mod):
+    """Empty/short history ⇒ no trend line, no crash."""
+    import re
+    mdef = mod.primary_metrics(DATA)
+    for hist in (None, [], HISTORY[:1]):  # short = single sample
+        lines = mod.render(DATA, 100, 40, 120, mdef, hist)
+        plain = "\n".join(re.sub(r"\033\[[0-9;]*m", "", l) for l in lines)
+        assert "trend " not in plain, f"history={hist}"
+
+
 def test_run_once_persists(mod):
     """--once path: fetch (monkeypatched) -> snapshot -> append; returns 0."""
     import tempfile, shutil

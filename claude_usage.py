@@ -986,7 +986,54 @@ def recent_section(cols):
         out.append(f"{star}{CREAM}{nm}{R}" + " " * gap + f"{DIM}{GREY}{meta}{R}")
     return out
 
-def render_panel(data, cols, rows, interval):
+# ── Trends / sparklines (read-only over history) ──────────────────────
+# Eight block glyphs give a compact per-metric trend. The scale is FIXED at
+# 0–100 (these are utilization percentages), not min/max-normalized, so the
+# sparkline is honestly comparable frame to frame and a flat-but-high metric
+# doesn't look like a flat-but-low one.
+_SPARK_GLYPHS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values, width=None):
+    """A block-glyph sparkline for a series of percentages (0–100, fixed scale).
+    Non-numeric entries are dropped; an empty series yields "". When `width` is
+    given, only the most recent `width` samples are shown."""
+    vals = [v for v in (values or []) if isinstance(v, (int, float))
+            and not isinstance(v, bool)]
+    if not vals:
+        return ""
+    if width and width > 0:
+        vals = vals[-width:]
+    top = len(_SPARK_GLYPHS) - 1
+    return "".join(
+        _SPARK_GLYPHS[round(min(100.0, max(0.0, float(v))) / 100.0 * top)]
+        for v in vals)
+
+
+def history_index(history):
+    """One pass over the history records → {label: [pct, ...]} in chronological
+    order. Non-numeric pcts are skipped. Built once per render frame so the panel
+    doesn't rescan the whole buffer for every metric."""
+    out = {}
+    for rec in history or []:
+        for lim in (rec.get("limits") or []):
+            label, pct = lim.get("label"), lim.get("pct")
+            if label and isinstance(pct, (int, float)) and not isinstance(pct, bool):
+                out.setdefault(label, []).append(float(pct))
+    return out
+
+
+def trend_series(history, label, n=None):
+    """The percentage series for one limit label across the history records, in
+    chronological order. `n` keeps only the last n samples. (For the render path,
+    prefer history_index() once per frame over calling this per metric.)"""
+    out = history_index(history).get(label, [])
+    if n and n > 0:
+        return out[-n:]
+    return out
+
+
+def render_panel(data, cols, rows, interval, history=None):
     now = datetime.now()
     lines = []
     t = now.strftime("%-I:%M%p").lower()
@@ -994,6 +1041,12 @@ def render_panel(data, cols, rows, interval):
     lines.append("")
 
     # ── Limits ────────────────────────────────────────────────────────
+    # Build the label → pct-series map once per frame (not once per metric).
+    trend_map = history_index(history)
+    # The trend line's visible prefix is exactly 16 cols ("          trend ");
+    # cap the sparkline so the row never exceeds the panel width and wraps.
+    spark_w = max(1, cols - 16)
+
     def bar_row(label, pct, iso, sev="normal"):
         scol = SEV_COL.get(sev, GREY)
         lab = label[:9]
@@ -1004,6 +1057,12 @@ def render_panel(data, cols, rows, interval):
             r = f"{RESET_GLYPH} {fmt_reset(iso)}"
             badge = "" if sev == "normal" else f"  {scol}({sev}){R}"
             lines.append(f"          {DIM}{GREY}{r}{R}{badge}")
+        # Trend sparkline — only once at least two samples exist for this metric,
+        # so it fills in as history accrues and never shows a lone dot.
+        series = trend_map.get(label, ())
+        if len(series) >= 2:
+            spark = sparkline(series, width=spark_w)
+            lines.append(f"          {DIM}{GREY}trend {CREAM}{spark}{R}")
 
     limits = all_limits(data)
     lines.append(_section("LIMITS"))
@@ -1084,7 +1143,7 @@ def render_panel(data, cols, rows, interval):
     return body
 
 # ── Top-level renderer ────────────────────────────────────────────────
-def render(data, cols, rows, interval, mdef):
+def render(data, cols, rows, interval, mdef, history=None):
     n = len(mdef)
     if rows < 7:
         return render_horizontal(data, cols, rows, interval, mdef)
@@ -1094,9 +1153,11 @@ def render(data, cols, rows, interval, mdef):
 
     now = datetime.now()
 
-    # Big window → full control panel with everything the API exposes.
+    # Big window → full control panel with everything the API exposes. This is
+    # the only layout roomy enough for trend sparklines; smaller ones ignore
+    # `history` and degrade cleanly to bars-only.
     if rows >= 20 and cols >= 46:
-        return render_panel(data, cols, rows, interval)
+        return render_panel(data, cols, rows, interval, history)
 
     if rows >= 12 and cols >= 22:
         lines = [header_full(cols), ""]
@@ -1324,7 +1385,14 @@ def main():
     cache, err = None, None
     last_fetch = last_extra = last_boot = 0.0
     last_buf, force = "", True
-    last_snap = None  # last snapshot written, for dedup (skip identical reads)
+    # Recent history for trend sparklines: seed from disk (so prior runs / cron
+    # samples show up immediately), then extend live. Read-only view; capped so
+    # a long-lived process doesn't grow it unbounded.
+    HIST_KEEP = 64
+    hist_recent = read_history(history_path)[-HIST_KEEP:]
+    # Seed dedup state from the last stored reading so the first live fetch of an
+    # unchanged reading isn't re-appended (a duplicate point / history line).
+    last_snap = hist_recent[-1] if hist_recent else None
 
     is_tty = sys.stdin.isatty()
     old_term = None
@@ -1393,17 +1461,21 @@ def main():
                 except Exception as e:
                     err = f"Error: {e}"
                 last_fetch = now
-                # Persist a snapshot of this reading, but only on a clean fetch
-                # and only when the numbers changed since the last write — a
-                # 2-min refresh of an unchanged reading shouldn't bloat history.
-                # Guarded broadly: neither a malformed reading nor a write error
-                # may ever kill the dashboard.
-                if persist and cache and not err:
+                # Snapshot this reading on a clean fetch, only when the numbers
+                # changed since the last one — a 2-min refresh of an unchanged
+                # reading shouldn't bloat history or the trend buffer. The
+                # in-memory buffer feeds sparklines even when file persistence is
+                # off; the file write is gated on `persist`. Guarded broadly:
+                # neither a malformed reading nor a write error kills the dash.
+                if cache and not err:
                     try:
                         snap = snapshot(cache)
                         if not same_reading(snap, last_snap):
-                            append_history(history_path, snap, history_max)
                             last_snap = snap
+                            hist_recent.append(snap)
+                            del hist_recent[:-HIST_KEEP]  # keep the tail bounded
+                            if persist:
+                                append_history(history_path, snap, history_max)
                     except Exception:  # noqa: BLE001 — persistence is best-effort
                         pass
             # Live extras — the lazy clock; manual [r] forces them too.
@@ -1419,7 +1491,7 @@ def main():
             mdef = primary_metrics(cache) if cache else []
             cols, rows = shutil.get_terminal_size((80, 24))
             lines = (error_lines(err, cols, rows) if err
-                     else render(cache, cols, rows, interval, mdef))
+                     else render(cache, cols, rows, interval, mdef, hist_recent))
             last_buf = draw(lines, last_buf)
 
             if is_tty:
