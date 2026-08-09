@@ -25,6 +25,7 @@ unreachable), pass --org or set the CLAUDE_ORG_ID environment variable.
 """
 
 import argparse
+import json
 import math
 import os
 import select
@@ -278,6 +279,22 @@ def _coerce_int(value):
         return None
 
 
+def _coerce_bool(value):
+    """Best-effort bool for CLI/env/config. None for missing/unrecognized so
+    precedence falls through. Accepts real bools and the usual string spellings
+    (config TOML gives a real bool; env vars arrive as strings)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 def resolve_setting(cli, env, cfg, default):
     """First non-None of (cli, env, cfg), else default. `is not None` (not
     truthiness) so a meaningful 0 — e.g. --bootstrap-interval 0 — wins over a
@@ -310,6 +327,12 @@ def resolve_runtime_config(cli, env, cfg):
                              cfg.get("cookie_source"), "auto")
     if source not in COOKIE_SOURCES:
         source = "auto"
+    persist = resolve_setting(_coerce_bool(cli.get("persist")),
+                              _coerce_bool(env.get("persist")),
+                              _coerce_bool(cfg.get("persist")), True)
+    history_path = resolve_setting(cli.get("history_path"), env.get("history_path"),
+                                   cfg.get("history_path"), None) or default_history_path()
+    history_path = os.path.expanduser(history_path)  # honor a ~ in config/env
     return {
         "interval": interval,
         # Never poll extras faster than the core clock — a big -n implies
@@ -318,6 +341,10 @@ def resolve_runtime_config(cli, env, cfg):
         "bootstrap_interval": bootstrap_interval,
         "org": org,
         "cookie_source": source,
+        "persist": persist,
+        "history_path": history_path,
+        # retention cap: max snapshots kept (0 = unlimited).
+        "history_max": max(0, i("history_max", 0)),
     }
 
 # ── Endpoints ─────────────────────────────────────────────────────────
@@ -1111,6 +1138,126 @@ def draw(lines, last):
         sys.stdout.flush()
     return buf
 
+
+# ── Snapshot persistence (history) ────────────────────────────────────
+# Each core refresh can be recorded as one line of JSON in an append-only
+# history file (JSONL) under $XDG_DATA_HOME/claude-usage/history.jsonl. We store
+# ONLY the numbers already shown on screen — limit %s + resets, and spend —
+# never raw endpoint payloads (privacy + size, D-03). JSONL was chosen over
+# SQLite (Q-02): it's greppable, append-only-cheap, trivially unit-testable
+# offline, and Phase 5's trends only need a sequential read. Revisit if querying
+# ever needs indexed access.
+def default_history_path():
+    """$XDG_DATA_HOME/claude-usage/history.jsonl (default ~/.local/share/...)."""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "claude-usage", "history.jsonl")
+
+
+def _money_value(m):
+    """Minor-units money dict -> float major units, or None. Mirrors fmt_money's
+    arithmetic but returns a number for storage instead of a display string."""
+    if not isinstance(m, dict):
+        return None
+    amt = m.get("amount_minor")
+    if amt is None:
+        return None
+    return amt / (10 ** m.get("exponent", 2))
+
+
+def snapshot(data):
+    """A serializable record of the current reading: timestamp + the surfaced
+    limits (label/pct/reset) + spend. Pure aside from the clock, which the tests
+    freeze via the module-level `datetime`, so output is deterministic."""
+    limits = [{"label": full, "pct": pct, "resets_at": iso}
+              for (full, _compact, pct, iso) in primary_metrics(data)]
+    sp = data.get("spend") or {}
+    used, limit = sp.get("used") or {}, sp.get("limit") or {}
+    currency = (used.get("currency") if isinstance(used, dict) else None) or \
+               (limit.get("currency") if isinstance(limit, dict) else None) or "USD"
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "limits": limits,
+        "spend": {
+            "used": _money_value(sp.get("used")),
+            "limit": _money_value(sp.get("limit")),
+            "balance": _money_value(sp.get("balance")),
+            "currency": currency,
+        },
+    }
+
+
+def same_reading(a, b):
+    """True if two snapshots carry the same numbers (ignoring the timestamp), so
+    the live loop can skip re-appending an identical reading every refresh."""
+    if not a or not b:
+        return False
+    return a.get("limits") == b.get("limits") and a.get("spend") == b.get("spend")
+
+
+def append_history(path, snap, history_max=0):
+    """Append one snapshot as a JSON line, creating parent dirs as needed. When
+    history_max > 0, keep only the most recent `history_max` records (cheap
+    tail-trim; the file stays small because snapshots are tiny and deduped)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(snap, separators=(",", ":")) + "\n")
+    if history_max and history_max > 0:
+        records = read_history(path)
+        if len(records) > history_max:
+            tail = records[-history_max:]
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for r in tail:
+                    fh.write(json.dumps(r, separators=(",", ":")) + "\n")
+            os.replace(tmp, path)
+
+
+def read_history(path):
+    """All snapshots from the history file as a list of dicts. Missing file -> [].
+    Corrupt/blank lines are skipped so a half-written line (e.g. a crash mid-
+    append) can't make the whole history unreadable."""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except (FileNotFoundError, OSError):
+        return []
+    return out
+
+
+def run_once(cookie, cfg, print_snap=False):
+    """Headless single-shot: fetch one reading, append a snapshot to history,
+    optionally echo it, and return a process exit code (0 ok, 1 on failure).
+    Silent by default so it's clean in a crontab; --print echoes the JSON."""
+    global BOOT
+    BOOT = fetch_bootstrap(cookie)
+    org = resolve_org(cfg["org"], BOOT, cookie)
+    try:
+        data = fetch(cookie, org)
+    except Exception as e:  # noqa: BLE001 — cron wants a nonzero exit, not a trace
+        print(f"claude-usage --once: fetch failed: {e}", file=sys.stderr)
+        return 1
+    snap = snapshot(data)
+    if cfg["persist"]:
+        try:
+            append_history(cfg["history_path"], snap, cfg["history_max"])
+        except OSError as e:
+            print(f"claude-usage --once: could not write history: {e}",
+                  file=sys.stderr)
+            return 1
+    if print_snap:
+        print(json.dumps(snap, separators=(",", ":")))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     # Flag defaults are None so the resolver can tell "unset" from an explicit
@@ -1130,30 +1277,52 @@ def main():
     ap.add_argument("--org", default=None,
                     help="organization UUID (default: auto-discovered from "
                          "/api/bootstrap)")
+    ap.add_argument("--once", action="store_true",
+                    help="fetch one snapshot, append it to history, exit "
+                         "(cron-friendly; silent unless --print)")
+    ap.add_argument("--print", dest="print_snap", action="store_true",
+                    help="with --once, also print the snapshot JSON to stdout")
+    ap.add_argument("--no-persist", dest="persist", action="store_const",
+                    const=False, default=None,
+                    help="don't write snapshots to the history file")
+    ap.add_argument("--history-path", default=None,
+                    help="override the history file location")
     args = ap.parse_args()
 
     # Precedence: CLI flag > env var > config file > built-in default.
     cli = {"interval": args.interval, "extras_interval": args.extras_interval,
            "bootstrap_interval": args.bootstrap_interval, "org": args.org,
-           "cookie_source": args.cookie_source}
+           "cookie_source": args.cookie_source, "persist": args.persist,
+           "history_path": args.history_path}
     env = {"interval": os.environ.get("CLAUDE_USAGE_INTERVAL"),
            "extras_interval": os.environ.get("CLAUDE_USAGE_EXTRAS_INTERVAL"),
            "bootstrap_interval": os.environ.get("CLAUDE_USAGE_BOOTSTRAP_INTERVAL"),
            "org": os.environ.get("CLAUDE_ORG_ID"),
-           "cookie_source": os.environ.get("CLAUDE_USAGE_COOKIE_SOURCE")}
+           "cookie_source": os.environ.get("CLAUDE_USAGE_COOKIE_SOURCE"),
+           "persist": os.environ.get("CLAUDE_USAGE_PERSIST"),
+           "history_path": os.environ.get("CLAUDE_USAGE_HISTORY_PATH")}
     cfg = resolve_runtime_config(cli, env, load_config())
     interval = cfg["interval"]
     extras_interval = cfg["extras_interval"]
     bootstrap_interval = cfg["bootstrap_interval"]
     cookie_source = cfg["cookie_source"]
+    persist = cfg["persist"]
+    history_path = cfg["history_path"]
+    history_max = cfg["history_max"]
 
     cookie = get_cookie(args.cookie, cookie_source)
+
+    # ── Headless one-shot: fetch once, persist, exit. Cron-friendly. ──
+    if args.once:
+        return run_once(cookie, cfg, args.print_snap)
+
     global BOOT, LIVE
     BOOT = fetch_bootstrap(cookie)  # account/org config for the big panel
     org = resolve_org(cfg["org"], BOOT, cookie)
     cache, err = None, None
     last_fetch = last_extra = last_boot = 0.0
     last_buf, force = "", True
+    last_snap = None  # last snapshot written, for dedup (skip identical reads)
 
     is_tty = sys.stdin.isatty()
     old_term = None
@@ -1214,6 +1383,17 @@ def main():
                 except Exception as e:
                     err = f"Error: {e}"
                 last_fetch = now
+                # Persist a snapshot of this reading, but only on a clean fetch
+                # and only when the numbers changed since the last write — a
+                # 2-min refresh of an unchanged reading shouldn't bloat history.
+                if persist and cache and not err:
+                    snap = snapshot(cache)
+                    if not same_reading(snap, last_snap):
+                        try:
+                            append_history(history_path, snap, history_max)
+                            last_snap = snap
+                        except OSError:
+                            pass  # a write failure must never kill the dash
             # Live extras — the lazy clock; manual [r] forces them too.
             if force or now - last_extra >= extras_interval:
                 LIVE = fetch_live(cookie, org)  # best-effort; may hold Nones

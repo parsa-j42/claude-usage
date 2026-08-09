@@ -157,8 +157,11 @@ def test_runtime_config_full_precedence(mod):
     rc = mod.resolve_runtime_config
     # Every source empty → built-in defaults.
     d = rc({}, {}, {})
-    assert d == {"interval": 120, "extras_interval": 300,
-                 "bootstrap_interval": 0, "org": None, "cookie_source": "auto"}
+    for k, v in {"interval": 120, "extras_interval": 300, "bootstrap_interval": 0,
+                 "org": None, "cookie_source": "auto", "persist": True,
+                 "history_max": 0}.items():
+        assert d[k] == v, (k, d[k])
+    assert d["history_path"].endswith("claude-usage/history.jsonl")
     # CLI beats env beats config, field by field.
     cli = {"interval": 10, "org": "CLI"}
     env = {"interval": 20, "org": "ENV", "cookie_source": "firefox"}
@@ -216,6 +219,114 @@ def test_load_config(mod):
         assert mod.load_config(bad) == {}
     finally:
         os.unlink(bad)
+
+
+# ── Phase 4: snapshot persistence + --once ────────────────────────────
+
+def test_persistence_settings_precedence(mod):
+    rc = mod.resolve_runtime_config
+    # persist: default on; env "false" turns it off; CLI False wins over config.
+    assert rc({}, {}, {})["persist"] is True
+    assert rc({}, {"persist": "false"}, {})["persist"] is False
+    assert rc({"persist": False}, {}, {"persist": True})["persist"] is False
+    assert rc({}, {}, {"persist": False})["persist"] is False
+    # history_path override flows through CLI > env > config.
+    assert rc({"history_path": "/a"}, {"history_path": "/b"}, {})["history_path"] == "/a"
+    assert rc({}, {}, {"history_path": "/c"})["history_path"] == "/c"
+    # A leading ~ in a config/env path is expanded.
+    assert rc({}, {}, {"history_path": "~/h.jsonl"})["history_path"] == \
+        os.path.expanduser("~/h.jsonl")
+    # history_max coerces and floors at 0.
+    assert rc({}, {}, {"history_max": "50"})["history_max"] == 50
+    assert rc({"history_max": -5}, {}, {})["history_max"] == 0
+
+
+def test_snapshot_shape(mod):
+    """snapshot() captures the surfaced limits + spend, with a frozen ts."""
+    snap = mod.snapshot(DATA)
+    assert snap["ts"] == "2026-08-07T14:30:15+00:00"  # frozen clock
+    labels = {l["label"] for l in snap["limits"]}
+    assert {"5-hour", "7-day"} <= labels, labels
+    # Percentages are carried through from the fixture's two limits.
+    pcts = {l["label"]: l["pct"] for l in snap["limits"]}
+    assert pcts["5-hour"] == 42.5 and pcts["7-day"] == 88.0
+    # Spend is stored as numbers (major units), not display strings.
+    assert snap["spend"]["used"] == 12.34
+    assert snap["spend"]["limit"] == 50.0
+    assert snap["spend"]["currency"] == "USD"
+    # Must be JSON-serializable (it's written as a JSON line).
+    import json
+    assert json.loads(json.dumps(snap)) == snap
+
+
+def test_history_roundtrip(mod):
+    import tempfile
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "sub", "history.jsonl")  # parent dir auto-created
+    try:
+        s1 = mod.snapshot(DATA)
+        s2 = mod.snapshot(LEGACY)
+        mod.append_history(path, s1)
+        mod.append_history(path, s2)
+        recs = mod.read_history(path)
+        assert recs == [s1, s2]
+        # Missing file reads back empty, never raises.
+        assert mod.read_history(os.path.join(d, "nope.jsonl")) == []
+        # A corrupt line is skipped, not fatal.
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("{not json}\n")
+        assert mod.read_history(path) == [s1, s2]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_history_retention_cap(mod):
+    import tempfile, shutil
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "history.jsonl")
+    try:
+        for i in range(5):
+            mod.append_history(path, {"ts": str(i), "limits": [], "spend": {}},
+                               history_max=3)
+        recs = mod.read_history(path)
+        assert [r["ts"] for r in recs] == ["2", "3", "4"]  # only last 3 kept
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_same_reading_dedup(mod):
+    a = mod.snapshot(DATA)
+    b = mod.snapshot(DATA)  # identical numbers, same frozen ts
+    assert mod.same_reading(a, b) is True
+    c = mod.snapshot(LEGACY)
+    assert mod.same_reading(a, c) is False
+    assert mod.same_reading(a, None) is False
+
+
+def test_run_once_persists(mod):
+    """--once path: fetch (monkeypatched) -> snapshot -> append; returns 0."""
+    import tempfile, shutil
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "history.jsonl")
+    try:
+        mod.fetch = lambda cookie, org: DATA
+        mod.fetch_bootstrap = lambda cookie: {"account": {"memberships": [
+            {"organization": {"uuid": "ORG"}}]}}
+        cfg = {"org": None, "persist": True, "history_path": path,
+               "history_max": 0}
+        rc = mod.run_once("cookie", cfg, print_snap=False)
+        assert rc == 0
+        recs = mod.read_history(path)
+        assert len(recs) == 1 and recs[0]["spend"]["used"] == 12.34
+        # A fetch failure yields a nonzero exit and writes nothing new.
+        def boom(cookie, org):
+            raise RuntimeError("network down")
+        mod.fetch = boom
+        assert mod.run_once("cookie", cfg, print_snap=False) == 1
+        assert len(mod.read_history(path)) == 1
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def main():

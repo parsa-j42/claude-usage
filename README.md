@@ -86,6 +86,31 @@ Keys, while running:
 | `--cookie`             | —       | Session cookie, e.g. `'sessionKey=...'`.            |
 | `--cookie-source`      | `auto`  | Read cookies from `chrome`, `firefox`, or `auto`.   |
 | `--org`                | —       | Organization UUID (see below).                      |
+| `--once`               | —       | Fetch one snapshot, append to history, exit.        |
+| `--print`              | —       | With `--once`, also print the snapshot JSON.        |
+| `--no-persist`         | —       | Don't write snapshots to the history file.          |
+| `--history-path`       | —       | Override the history file location.                 |
+
+## History & headless mode
+
+Each core refresh records a small snapshot — the limit percentages and their
+reset times, plus spend — as one line of JSON in an append-only history file at
+`$XDG_DATA_HOME/claude-usage/history.jsonl`
+(`~/.local/share/claude-usage/history.jsonl`). Only the numbers already on
+screen are stored; never raw API payloads. Identical consecutive readings are
+skipped so an idle dashboard doesn't bloat the file.
+
+`--once` is a headless, cron-friendly mode: it fetches a single snapshot,
+appends it, and exits silently (add `--print` to echo the JSON). A crontab line
+that records your usage every 15 minutes:
+
+```cron
+*/15 * * * * claude-usage --once
+```
+
+Persistence is on by default; disable it with `--no-persist` (or `persist =
+false` in config). This history file is the foundation for the trends and
+alerting features that follow.
 
 ## Configuration
 
@@ -105,11 +130,17 @@ extras_interval = 300
 bootstrap_interval = 0
 cookie_source = "firefox"
 org = "your-org-uuid"
+
+# History / persistence
+persist = true
+history_path = "~/.local/share/claude-usage/history.jsonl"
+history_max = 0          # cap on records kept (0 = unlimited)
 ```
 
 Matching environment variables: `CLAUDE_USAGE_INTERVAL`,
 `CLAUDE_USAGE_EXTRAS_INTERVAL`, `CLAUDE_USAGE_BOOTSTRAP_INTERVAL`,
-`CLAUDE_USAGE_COOKIE_SOURCE`, and `CLAUDE_ORG_ID` (for `org`).
+`CLAUDE_USAGE_COOKIE_SOURCE`, `CLAUDE_USAGE_PERSIST`,
+`CLAUDE_USAGE_HISTORY_PATH`, and `CLAUDE_ORG_ID` (for `org`).
 
 ## Authentication
 
