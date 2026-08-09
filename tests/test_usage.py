@@ -304,6 +304,39 @@ def test_same_reading_dedup(mod):
     assert mod.same_reading(a, None) is False
 
 
+def test_append_history_bare_relative_path(mod):
+    """A history_path with no directory component must not raise (os.makedirs('')
+    would). Write into a temp cwd so we don't litter the repo."""
+    import tempfile, shutil
+    d = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(d)
+        mod.append_history("history.jsonl", {"ts": "1", "limits": [], "spend": {}})
+        assert mod.read_history("history.jsonl") == [
+            {"ts": "1", "limits": [], "spend": {}}]
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_once_snapshot_error_is_clean(mod):
+    """A reading that breaks snapshot() yields exit 1, not a traceback."""
+    import tempfile, shutil
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "history.jsonl")
+    try:
+        mod.fetch_bootstrap = lambda cookie: {"account": {"memberships": [
+            {"organization": {"uuid": "ORG"}}]}}
+        # `data` whose limits entry is a bare string breaks all_limits/primary.
+        mod.fetch = lambda cookie, org: {"limits": ["not-a-dict"]}
+        cfg = {"org": None, "persist": True, "history_path": path, "history_max": 0}
+        assert mod.run_once("ck", cfg, print_snap=False) == 1
+        assert mod.read_history(path) == []  # nothing written
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_once_persists(mod):
     """--once path: fetch (monkeypatched) -> snapshot -> append; returns 0."""
     import tempfile, shutil

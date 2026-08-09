@@ -97,17 +97,21 @@ Each core refresh records a small snapshot — the limit percentages and their
 reset times, plus spend — as one line of JSON in an append-only history file at
 `$XDG_DATA_HOME/claude-usage/history.jsonl`
 (`~/.local/share/claude-usage/history.jsonl`). Only the numbers already on
-screen are stored; never raw API payloads. Identical consecutive readings are
-skipped so an idle dashboard doesn't bloat the file.
+screen are stored; never raw API payloads. In the **live dashboard**, a refresh
+whose numbers match the last stored reading is skipped, so an idle dashboard
+doesn't bloat the file.
 
 `--once` is a headless, cron-friendly mode: it fetches a single snapshot,
-appends it, and exits silently (add `--print` to echo the JSON). A crontab line
-that records your usage every 15 minutes:
+appends it, and exits silently (add `--print` to echo the JSON). Each `--once`
+run writes exactly one record — it does **not** dedup — so you control the
+sample cadence via cron. A crontab line that records your usage every 15
+minutes:
 
 ```cron
 */15 * * * * claude-usage --once
 ```
 
+Use `history_max` to cap how many records are kept if you sample often.
 Persistence is on by default; disable it with `--no-persist` (or `persist =
 false` in config). This history file is the foundation for the trends and
 alerting features that follow.

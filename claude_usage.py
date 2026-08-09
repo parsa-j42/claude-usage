@@ -1199,7 +1199,9 @@ def append_history(path, snap, history_max=0):
     """Append one snapshot as a JSON line, creating parent dirs as needed. When
     history_max > 0, keep only the most recent `history_max` records (cheap
     tail-trim; the file stays small because snapshots are tiny and deduped)."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    if parent:  # empty for a bare relative filename — cwd already exists
+        os.makedirs(parent, exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(snap, separators=(",", ":")) + "\n")
     if history_max and history_max > 0:
@@ -1242,10 +1244,10 @@ def run_once(cookie, cfg, print_snap=False):
     org = resolve_org(cfg["org"], BOOT, cookie)
     try:
         data = fetch(cookie, org)
+        snap = snapshot(data)
     except Exception as e:  # noqa: BLE001 — cron wants a nonzero exit, not a trace
         print(f"claude-usage --once: fetch failed: {e}", file=sys.stderr)
         return 1
-    snap = snapshot(data)
     if cfg["persist"]:
         try:
             append_history(cfg["history_path"], snap, cfg["history_max"])
@@ -1357,6 +1359,7 @@ def main():
                         or (bool(hdrs.get("cf-ray"))
                             and "cloudflare" in hdrs.get("Server", "").lower()
                             and not body.lstrip().startswith("{")))
+                    recovered = False
                     if code in (401, 403):
                         # Cookie may have just rotated in Chrome — re-read and
                         # retry once before surfacing an error to the user.
@@ -1367,9 +1370,16 @@ def main():
                                 try:
                                     cache, err = fetch(cookie, org), None
                                     last_extra = 0  # re-pull extras w/ new cookie
+                                    recovered = True
                                 except Exception:
                                     pass
-                    if cf_challenge:
+                    # Only surface an error if the retry did NOT recover — a
+                    # successful re-fetch must not be masked by the (first-
+                    # response) challenge/auth message, which would also drop
+                    # the good snapshot below.
+                    if recovered:
+                        pass
+                    elif cf_challenge:
                         # Cloudflare challenge, not an auth problem: the
                         # cf_clearance cookie is stale or _UA no longer matches
                         # the Chrome that earned it.
@@ -1386,14 +1396,16 @@ def main():
                 # Persist a snapshot of this reading, but only on a clean fetch
                 # and only when the numbers changed since the last write — a
                 # 2-min refresh of an unchanged reading shouldn't bloat history.
+                # Guarded broadly: neither a malformed reading nor a write error
+                # may ever kill the dashboard.
                 if persist and cache and not err:
-                    snap = snapshot(cache)
-                    if not same_reading(snap, last_snap):
-                        try:
+                    try:
+                        snap = snapshot(cache)
+                        if not same_reading(snap, last_snap):
                             append_history(history_path, snap, history_max)
                             last_snap = snap
-                        except OSError:
-                            pass  # a write failure must never kill the dash
+                    except Exception:  # noqa: BLE001 — persistence is best-effort
+                        pass
             # Live extras — the lazy clock; manual [r] forces them too.
             if force or now - last_extra >= extras_interval:
                 LIVE = fetch_live(cookie, org)  # best-effort; may hold Nones
@@ -1429,4 +1441,7 @@ def main():
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
 
 if __name__ == "__main__":
-    main()
+    # Propagate main()'s return value as the exit code so `python claude_usage.py
+    # --once` reports fetch/persist failures to cron, matching the console-script
+    # wrapper (which does sys.exit(main())).
+    sys.exit(main())
