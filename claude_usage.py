@@ -1010,18 +1010,24 @@ def sparkline(values, width=None):
         for v in vals)
 
 
-def trend_series(history, label, n=None):
-    """The percentage series for one limit label across the history records, in
-    chronological order. Records without that label (or without a numeric pct)
-    are skipped. `n` keeps only the last n samples."""
-    out = []
+def history_index(history):
+    """One pass over the history records → {label: [pct, ...]} in chronological
+    order. Non-numeric pcts are skipped. Built once per render frame so the panel
+    doesn't rescan the whole buffer for every metric."""
+    out = {}
     for rec in history or []:
         for lim in (rec.get("limits") or []):
-            if lim.get("label") == label:
-                pct = lim.get("pct")
-                if isinstance(pct, (int, float)) and not isinstance(pct, bool):
-                    out.append(float(pct))
-                break
+            label, pct = lim.get("label"), lim.get("pct")
+            if label and isinstance(pct, (int, float)) and not isinstance(pct, bool):
+                out.setdefault(label, []).append(float(pct))
+    return out
+
+
+def trend_series(history, label, n=None):
+    """The percentage series for one limit label across the history records, in
+    chronological order. `n` keeps only the last n samples. (For the render path,
+    prefer history_index() once per frame over calling this per metric.)"""
+    out = history_index(history).get(label, [])
     if n and n > 0:
         return out[-n:]
     return out
@@ -1035,6 +1041,12 @@ def render_panel(data, cols, rows, interval, history=None):
     lines.append("")
 
     # ── Limits ────────────────────────────────────────────────────────
+    # Build the label → pct-series map once per frame (not once per metric).
+    trend_map = history_index(history)
+    # The trend line's visible prefix is exactly 16 cols ("          trend ");
+    # cap the sparkline so the row never exceeds the panel width and wraps.
+    spark_w = max(1, cols - 16)
+
     def bar_row(label, pct, iso, sev="normal"):
         scol = SEV_COL.get(sev, GREY)
         lab = label[:9]
@@ -1047,9 +1059,9 @@ def render_panel(data, cols, rows, interval, history=None):
             lines.append(f"          {DIM}{GREY}{r}{R}{badge}")
         # Trend sparkline — only once at least two samples exist for this metric,
         # so it fills in as history accrues and never shows a lone dot.
-        series = trend_series(history, label, n=max(8, cols - 12))
+        series = trend_map.get(label, ())
         if len(series) >= 2:
-            spark = sparkline(series)
+            spark = sparkline(series, width=spark_w)
             lines.append(f"          {DIM}{GREY}trend {CREAM}{spark}{R}")
 
     limits = all_limits(data)
@@ -1373,12 +1385,14 @@ def main():
     cache, err = None, None
     last_fetch = last_extra = last_boot = 0.0
     last_buf, force = "", True
-    last_snap = None  # last snapshot written, for dedup (skip identical reads)
     # Recent history for trend sparklines: seed from disk (so prior runs / cron
     # samples show up immediately), then extend live. Read-only view; capped so
     # a long-lived process doesn't grow it unbounded.
     HIST_KEEP = 64
     hist_recent = read_history(history_path)[-HIST_KEEP:]
+    # Seed dedup state from the last stored reading so the first live fetch of an
+    # unchanged reading isn't re-appended (a duplicate point / history line).
+    last_snap = hist_recent[-1] if hist_recent else None
 
     is_tty = sys.stdin.isatty()
     old_term = None

@@ -368,6 +368,30 @@ def test_trend_series(mod):
     assert mod.trend_series(None, "5-hour") == []
 
 
+def test_history_index(mod):
+    idx = mod.history_index(HISTORY)
+    assert set(idx) == {"5-hour", "7-day"}
+    assert idx["5-hour"] == [0, 14, 28, 42, 57, 71, 85, 100]
+    assert mod.history_index(None) == {}
+    # Non-numeric / bool pcts and unlabeled entries are dropped.
+    assert mod.history_index([{"limits": [
+        {"label": "x", "pct": True}, {"label": None, "pct": 5},
+        {"label": "x", "pct": 5}]}]) == {"x": [5.0]}
+
+
+def test_panel_trend_line_fits_width(mod):
+    """With a long history the trend line must never exceed the panel width (a
+    16-col prefix + capped glyphs), or it wraps and breaks the fixed layout."""
+    long_hist = [{"limits": [{"label": "5-hour", "pct": (i * 7) % 100},
+                             {"label": "7-day", "pct": (i * 3) % 100}]}
+                 for i in range(60)]  # more than any width would show
+    mdef = mod.primary_metrics(DATA)
+    for cols in (46, 60, 100):
+        lines = _strip(mod.render(DATA, cols, 40, 120, mdef, long_hist))
+        assert max(len(l) for l in lines) <= cols, f"overflow at cols={cols}"
+        assert any(l.strip().startswith("trend ") for l in lines)
+
+
 def _strip(lines):
     import re
     return [re.sub(r"\033\[[0-9;]*m", "", l) for l in lines]
