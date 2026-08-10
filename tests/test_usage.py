@@ -723,6 +723,139 @@ def test_run_once_exit_code_on_alert(mod):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ── Phase 7: selectable color themes ──────────────────────────────────
+
+# Hash of the full render matrix (both fixtures × every size, with history)
+# captured from the code as it stood BEFORE the theme system existed. The
+# default theme must reproduce it byte for byte, forever — this is the
+# no-visual-regression gate the phase is built around. If a deliberate change
+# to the default palette or the renderer ever makes this fail, re-capture it in
+# the same commit and say so in the message.
+GOLDEN_DEFAULT_RENDER = \
+    "d3d166282b5585fe64bde958befb2c9e43b0e4526deb66193c4ac9a7182c0162"
+
+
+def _render_matrix_hash(mod):
+    import hashlib
+    blob = []
+    for data in (DATA, LEGACY):
+        for cols, rows in SIZES:
+            mdef = mod.primary_metrics(data)
+            blob.append("\n".join(mod.render(data, cols, rows, 120, mdef, HISTORY)))
+    return hashlib.sha256("\x00".join(blob).encode()).hexdigest()
+
+
+def test_default_theme_is_byte_identical(mod):
+    """The default palette reproduces the pre-theme output exactly."""
+    mod.apply_theme("claude")
+    assert _render_matrix_hash(mod) == GOLDEN_DEFAULT_RENDER, (
+        "default theme changed the rendered output")
+    # apply_theme() defaults to the default theme, and reports what it applied.
+    assert mod.apply_theme() == "claude"
+    assert _render_matrix_hash(mod) == GOLDEN_DEFAULT_RENDER
+
+
+def test_every_theme_renders_stably(mod):
+    """Each theme renders the whole size matrix: right line count, no crash,
+    deterministic, and structurally identical to the default (themes change
+    color only — never layout)."""
+    import re
+    ansi = re.compile(r"\033\[[0-9;]*m")
+    baselines = {}
+    mod.apply_theme("claude")
+    for data_name, data in (("DATA", DATA), ("LEGACY", LEGACY)):
+        for cols, rows in SIZES:
+            mdef = mod.primary_metrics(data)
+            lines = mod.render(data, cols, rows, 120, mdef, HISTORY)
+            baselines[(data_name, cols, rows)] = [ansi.sub("", l) for l in lines]
+
+    for name in mod.THEMES:
+        mod.apply_theme(name)
+        for data_name, data in (("DATA", DATA), ("LEGACY", LEGACY)):
+            for cols, rows in SIZES:
+                mdef = mod.primary_metrics(data)
+                lines = mod.render(data, cols, rows, 120, mdef, HISTORY)
+                assert len(lines) == rows, f"{name} {cols}x{rows}"
+                again = mod.render(data, cols, rows, 120, mdef, HISTORY)
+                assert lines == again, f"{name} {cols}x{rows} not deterministic"
+                assert [ansi.sub("", l) for l in lines] == \
+                    baselines[(data_name, cols, rows)], \
+                    f"{name} changed layout at {cols}x{rows}"
+    mod.apply_theme("claude")
+
+
+def test_alternative_themes_actually_differ(mod):
+    """Every non-default theme produces visibly different output — a theme that
+    silently aliased the default would pass every other test here."""
+    seen = {}
+    for name in mod.THEMES:
+        mod.apply_theme(name)
+        seen[name] = _render_matrix_hash(mod)
+    mod.apply_theme("claude")
+    assert len(set(seen.values())) == len(seen), f"themes collide: {seen}"
+    assert seen["claude"] == GOLDEN_DEFAULT_RENDER
+    # At least one cool/mono/high-contrast alternative exists, per the phase.
+    assert {"cool", "mono", "contrast"} <= set(mod.THEMES)
+
+
+def test_theme_definitions_are_complete(mod):
+    """Every theme defines every palette key, so switching can't leave a
+    color unbound (which would render as a literal empty string)."""
+    required = {"brand", "text", "muted", "track", "on", "error", "sev", "heat"}
+    for name, t in mod.THEMES.items():
+        assert set(t) == required, f"{name}: {set(t) ^ required}"
+        for key in ("brand", "text", "muted", "track", "on", "error"):
+            assert len(t[key]) == 3 and all(0 <= c <= 255 for c in t[key]), \
+                f"{name}.{key}"
+        assert set(t["sev"]) == {"normal", "warning", "critical"}, name
+        # The heat ramp must span 0..1 in ascending order so heat() can
+        # interpolate across it without falling off either end.
+        stops = [s for s, _ in t["heat"]]
+        assert stops[0] == 0.0 and stops[-1] == 1.0, f"{name}: {stops}"
+        assert stops == sorted(stops), f"{name}: {stops}"
+        for _, c in t["heat"]:
+            assert len(c) == 3 and all(0 <= v <= 255 for v in c), name
+
+
+def test_heat_follows_active_theme(mod):
+    """heat() reads the active theme's ramp, at the endpoints and between."""
+    for name, t in mod.THEMES.items():
+        mod.apply_theme(name)
+        assert mod.heat(0) == t["heat"][0][1], name
+        assert mod.heat(100) == t["heat"][-1][1], name
+        assert mod.heat(150) == t["heat"][-1][1], name   # clamped
+        assert mod.heat(-10) == t["heat"][0][1], name    # clamped
+        mid = mod.heat(65)
+        assert all(0 <= c <= 255 for c in mid), name
+    mod.apply_theme("claude")
+    # The default ramp's exact interpolation is unchanged.
+    assert mod.heat(0) == (226, 184, 142)
+    assert mod.heat(100) == (205, 72, 56)
+
+
+def test_apply_theme_rejects_unknown(mod):
+    """An unknown theme falls back to the default instead of raising — a stale
+    config value must not stop the dashboard from starting."""
+    assert mod.apply_theme("no-such-theme") == "claude"
+    assert mod.THEME == "claude"
+    assert _render_matrix_hash(mod) == GOLDEN_DEFAULT_RENDER
+    assert mod.apply_theme(None) == "claude"
+    mod.apply_theme("claude")
+
+
+def test_theme_setting_precedence(mod):
+    """CLI > env > config for --theme, with validation at every layer."""
+    assert mod.resolve_runtime_config({}, {}, {})["theme"] == "claude"
+    assert mod.resolve_runtime_config({}, {}, {"theme": "mono"})["theme"] == "mono"
+    assert mod.resolve_runtime_config({}, {"theme": "cool"},
+                                      {"theme": "mono"})["theme"] == "cool"
+    assert mod.resolve_runtime_config({"theme": "contrast"}, {"theme": "cool"},
+                                      {"theme": "mono"})["theme"] == "contrast"
+    # Garbage at any layer degrades to the default rather than raising.
+    assert mod.resolve_runtime_config({}, {}, {"theme": "bogus"})["theme"] == "claude"
+    assert mod.resolve_runtime_config({}, {}, {"theme": 42})["theme"] == "claude"
+
+
 def main():
     mod = load_module()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -35,7 +35,8 @@ with your existing browser session cookie — no API key, nothing to configure.
   credits and spend, extra usage, plus account, connectors/MCP, cowork status,
   live code sessions, and recent chats (large windows only).
 - **Warm "heat" gauge.** Bars shift from soft tan through Claude orange to rust
-  red as a limit fills, so severity reads at a glance.
+  red as a limit fills, so severity reads at a glance — or pick another of the
+  four themes (`cool`, `mono`, `contrast`) with `--theme`.
 - **Threshold alerts.** Configurable per-limit warning levels, delivered by
   `notify-send` (or stdout), fired once per crossing — from the live dashboard
   or a cron `--once` run.
@@ -97,6 +98,7 @@ Keys, while running:
 | `--alert-threshold`    | —       | Warn at this percent for *every* limit.             |
 | `--alert-notifier`     | `auto`  | `auto`, `notify-send`, `stdout`, or `none`.         |
 | `--alert-state-path`   | —       | Override where once-per-crossing state is stored.   |
+| `--theme`              | `claude`| Color theme: `claude`, `cool`, `mono`, `contrast`.  |
 
 ## History & headless mode
 
@@ -139,6 +141,27 @@ Trends are seeded from the history file at startup (so prior runs and cron
 `--once` samples show up right away) and fill in further as the dashboard runs.
 They appear only in the full panel; smaller layouts show bars alone. The trend
 buffer works even with `--no-persist` (it just isn't written to disk).
+
+## Themes
+
+`--theme NAME` (or `theme = "…"` in the config) picks the palette. Themes change
+**color only** — never layout, glyphs, or widths — so every window size renders
+the same shape whichever you pick.
+
+| Theme      | Look                                                              |
+| ---------- | ----------------------------------------------------------------- |
+| `claude`   | **Default.** Warm: soft tan → Claude orange → rust red.           |
+| `cool`     | Pale cyan → blue → violet → hot magenta. Same reading, cool side. |
+| `mono`     | Greyscale; severity reads as brightness. Good for screenshots.    |
+| `contrast` | High-contrast green → yellow → orange → red on pure white text.   |
+
+```bash
+claude-usage --theme contrast
+```
+
+The default is unchanged from before themes existed — byte for byte, and there's
+a test pinning it to a golden hash so it stays that way. An unrecognized theme
+name falls back to the default rather than refusing to start.
 
 ## Threshold alerts
 
@@ -197,6 +220,7 @@ extras_interval = 300
 bootstrap_interval = 0
 cookie_source = "firefox"
 org = "your-org-uuid"
+theme = "claude"         # claude | cool | mono | contrast
 
 # History / persistence
 persist = true
@@ -218,7 +242,8 @@ Matching environment variables: `CLAUDE_USAGE_INTERVAL`,
 `CLAUDE_USAGE_COOKIE_SOURCE`, `CLAUDE_USAGE_PERSIST`,
 `CLAUDE_USAGE_HISTORY_PATH`, `CLAUDE_USAGE_ALERTS`,
 `CLAUDE_USAGE_ALERT_THRESHOLD`, `CLAUDE_USAGE_ALERT_NOTIFIER`,
-`CLAUDE_USAGE_ALERT_STATE_PATH`, and `CLAUDE_ORG_ID` (for `org`).
+`CLAUDE_USAGE_ALERT_STATE_PATH`, `CLAUDE_USAGE_THEME`, and `CLAUDE_ORG_ID`
+(for `org`).
 
 The `[alert]` threshold table is config-file-only — there's no sensible flat
 spelling for a per-limit map on the command line or in the environment.
