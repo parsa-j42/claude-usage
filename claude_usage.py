@@ -59,10 +59,6 @@ def usage_url(org: str) -> str:
 # ── ANSI helpers ──────────────────────────────────────────────────────
 R = "\033[0m"; DIM = "\033[2m"; BOLD = "\033[1m"
 def rgb(r, g, b): return f"\033[38;2;{r};{g};{b}m"
-CLAUDE = rgb(217, 119, 87)
-CREAM  = rgb(240, 237, 230)
-GREY   = rgb(138, 136, 128)
-TRACK  = rgb(62, 60, 56)
 STAR   = "✳"
 REFRESH = "⟳"
 RESET_GLYPH = "↺"
@@ -71,14 +67,108 @@ GAUGE = "○◔◑◕●"  # circular fill gauge: 0 / 25 / 50 / 75 / 100%
 def gauge_glyph(pct):
     return GAUGE[int(round(max(0.0, min(pct, 100.0)) / 100.0 * 4))]
 
-# Warm "heat" ramp — stays in Claude's palette while encoding severity:
-# low usage = soft tan, climbing through Claude orange to a rust red.
-HEAT = [
-    (0.00, (226, 184, 142)),
-    (0.50, (217, 132,  80)),
-    (0.80, (210,  98,  58)),
-    (1.00, (205,  72,  56)),
-]
+# ── Themes ────────────────────────────────────────────────────────────
+# Every color in the renderer comes from the active theme. A theme is a plain
+# dict of RGB triples plus the "heat" ramp — the gradient a usage bar walks as
+# it fills, which is what encodes severity at a glance. Themes change color
+# ONLY: no glyph, width, or layout differs between them, so the size matrix
+# renders identically in structure whichever one is active.
+#
+# `claude` is the default and reproduces the pre-theme look byte for byte
+# (there's a test pinning that against a golden hash — see the ledger).
+THEMES = {
+    # Warm, in Claude's own palette: soft tan climbing through Claude orange
+    # to a rust red.
+    "claude": {
+        "brand": (217, 119, 87),
+        "text":  (240, 237, 230),
+        "muted": (138, 136, 128),
+        "track": (62, 60, 56),
+        "on":    (217, 132, 80),
+        "error": (205, 72, 56),
+        "sev": {"normal": (138, 136, 128), "warning": (217, 132, 80),
+                "critical": (205, 72, 56)},
+        "heat": [(0.00, (226, 184, 142)), (0.50, (217, 132, 80)),
+                 (0.80, (210, 98, 58)), (1.00, (205, 72, 56))],
+    },
+    # Cool counterpart: pale cyan through blue and violet to a hot magenta.
+    # Same severity reading, opposite temperature.
+    "cool": {
+        "brand": (94, 166, 214),
+        "text":  (228, 236, 243),
+        "muted": (124, 138, 152),
+        "track": (48, 58, 68),
+        "on":    (86, 182, 194),
+        "error": (206, 74, 132),
+        "sev": {"normal": (124, 138, 152), "warning": (108, 142, 214),
+                "critical": (206, 74, 132)},
+        "heat": [(0.00, (150, 206, 214)), (0.50, (94, 152, 210)),
+                 (0.80, (132, 116, 204)), (1.00, (206, 74, 132))],
+    },
+    # Greyscale, for monochrome terminals and screenshots: severity reads as
+    # brightness, dim at rest and near-white when a limit is nearly spent.
+    "mono": {
+        "brand": (240, 240, 240),
+        "text":  (230, 230, 230),
+        "muted": (130, 130, 130),
+        "track": (58, 58, 58),
+        "on":    (210, 210, 210),
+        "error": (245, 245, 245),
+        "sev": {"normal": (130, 130, 130), "warning": (190, 190, 190),
+                "critical": (245, 245, 245)},
+        "heat": [(0.00, (110, 110, 110)), (0.50, (162, 162, 162)),
+                 (0.80, (206, 206, 206)), (1.00, (250, 250, 250))],
+    },
+    # High-contrast: the conventional green→yellow→orange→red severity ramp on
+    # pure white text. The most legible option, and the one that doesn't ask you
+    # to learn what "tan" means.
+    "contrast": {
+        "brand": (255, 176, 0),
+        "text":  (255, 255, 255),
+        "muted": (170, 170, 170),
+        "track": (70, 70, 70),
+        "on":    (0, 220, 120),
+        "error": (255, 60, 60),
+        "sev": {"normal": (170, 170, 170), "warning": (255, 190, 0),
+                "critical": (255, 60, 60)},
+        "heat": [(0.00, (0, 210, 110)), (0.50, (255, 214, 0)),
+                 (0.80, (255, 140, 0)), (1.00, (255, 60, 60))],
+    },
+}
+DEFAULT_THEME = "claude"
+
+# The active palette, as ready-to-emit escape sequences. These are module
+# globals because every render helper reads them by name; apply_theme() rebinds
+# them in place, which is what keeps theming a color-only change instead of
+# threading a palette argument through the whole render block.
+CLAUDE = CREAM = GREY = TRACK = ON_COL = ERR_COL = ""
+SEV_COL = {}
+HEAT = []
+THEME = DEFAULT_THEME
+
+
+def apply_theme(name=DEFAULT_THEME):
+    """Bind the active palette. An unknown name falls back to the default
+    rather than raising — a stale config value shouldn't stop the dashboard
+    from starting. Returns the name actually applied."""
+    global CLAUDE, CREAM, GREY, TRACK, ON_COL, ERR_COL, SEV_COL, HEAT, THEME
+    if name not in THEMES:
+        name = DEFAULT_THEME
+    t = THEMES[name]
+    CLAUDE = rgb(*t["brand"])
+    CREAM = rgb(*t["text"])
+    GREY = rgb(*t["muted"])
+    TRACK = rgb(*t["track"])
+    ON_COL = rgb(*t["on"])
+    ERR_COL = rgb(*t["error"])
+    SEV_COL = {k: rgb(*v) for k, v in t["sev"].items()}
+    HEAT = list(t["heat"])
+    THEME = name
+    return name
+
+
+apply_theme()  # the default palette is live at import time
+
 
 def heat(pct):
     t = max(0.0, min(pct / 100.0, 1.0))
@@ -349,6 +439,10 @@ def resolve_runtime_config(cli, env, cfg):
                                cfg.get("alert_notifier"), "auto")
     if notifier not in ALERT_NOTIFIERS:
         notifier = "auto"
+    theme = resolve_setting(cli.get("theme"), env.get("theme"),
+                            cfg.get("theme"), DEFAULT_THEME)
+    if theme not in THEMES:
+        theme = DEFAULT_THEME  # a stale name shouldn't stop the dash starting
     alert_state_path = resolve_setting(
         cli.get("alert_state_path"), env.get("alert_state_path"),
         cfg.get("alert_state_path"), None) or default_alert_state_path(history_path)
@@ -370,6 +464,7 @@ def resolve_runtime_config(cli, env, cfg):
         # 0 = fire once per crossing (never re-nag until the limit resets).
         "alert_cooldown": max(0, i("alert_cooldown", 0)),
         "alert_state_path": os.path.expanduser(alert_state_path),
+        "theme": theme,
     }
 
 # ── Endpoints ─────────────────────────────────────────────────────────
@@ -833,12 +928,7 @@ def render_stacked(data, cols, rows, interval, mdef):
     return core[:rows]
 
 # ── Big control panel (large windows) ─────────────────────────────────
-SEV_COL = {
-    "normal": rgb(138, 136, 128),
-    "warning": rgb(217, 132, 80),
-    "critical": rgb(205, 72, 56),
-}
-ON_COL = rgb(217, 132, 80)
+# (SEV_COL / ON_COL live with the rest of the palette, up in the theme block.)
 
 # Account/org config from /api/bootstrap, fetched once at startup. The panel
 # reads it for the ACCOUNT / CONNECTORS / COWORK sections; None → sections skip.
@@ -1117,7 +1207,7 @@ def render_panel(data, cols, rows, interval, history=None):
     if sp.get("cap") is not None:
         lines.append(_kv("Cap", fmt_money(sp.get("cap")), cols))
     enabled = sp.get("enabled")
-    ecol = rgb(217, 132, 80) if enabled else GREY
+    ecol = ON_COL if enabled else GREY
     lines.append(_kv("Credits", "enabled" if enabled else "off", cols, vcol=ecol))
     if sp.get("auto_reload") is not None:
         lines.append(_kv("Auto-reload",
@@ -1134,7 +1224,7 @@ def render_panel(data, cols, rows, interval, history=None):
         if eu.get("is_enabled"):
             util = eu.get("utilization")
             lines.append(_kv("Status", "enabled", cols,
-                             vcol=rgb(217, 132, 80)))
+                             vcol=ON_COL))
             if eu.get("monthly_limit") is not None:
                 lines.append(_kv("Monthly limit",
                                  fmt_money(eu.get("monthly_limit"))
@@ -1210,7 +1300,7 @@ def render(data, cols, rows, interval, mdef, history=None):
     return lines[:rows]
 
 def error_lines(msg, cols, rows):
-    return [f"{rgb(205, 72, 56)}{ln[:cols]}{R}" for ln in msg.split("\n")][:rows]
+    return [f"{ERR_COL}{ln[:cols]}{R}" for ln in msg.split("\n")][:rows]
 
 def draw(lines, last):
     buf = "\033[H"
@@ -1604,6 +1694,8 @@ def main():
                          "else stdout]")
     ap.add_argument("--alert-state-path", default=None,
                     help="override where once-per-crossing state is stored")
+    ap.add_argument("--theme", choices=sorted(THEMES), default=None,
+                    help=f"color theme [{DEFAULT_THEME}]")
     args = ap.parse_args()
 
     # Precedence: CLI flag > env var > config file > built-in default.
@@ -1613,7 +1705,7 @@ def main():
            "history_path": args.history_path, "alerts": args.alerts,
            "alert_threshold": args.alert_threshold,
            "alert_notifier": args.alert_notifier,
-           "alert_state_path": args.alert_state_path}
+           "alert_state_path": args.alert_state_path, "theme": args.theme}
     env = {"interval": os.environ.get("CLAUDE_USAGE_INTERVAL"),
            "extras_interval": os.environ.get("CLAUDE_USAGE_EXTRAS_INTERVAL"),
            "bootstrap_interval": os.environ.get("CLAUDE_USAGE_BOOTSTRAP_INTERVAL"),
@@ -1624,7 +1716,8 @@ def main():
            "alerts": os.environ.get("CLAUDE_USAGE_ALERTS"),
            "alert_threshold": os.environ.get("CLAUDE_USAGE_ALERT_THRESHOLD"),
            "alert_notifier": os.environ.get("CLAUDE_USAGE_ALERT_NOTIFIER"),
-           "alert_state_path": os.environ.get("CLAUDE_USAGE_ALERT_STATE_PATH")}
+           "alert_state_path": os.environ.get("CLAUDE_USAGE_ALERT_STATE_PATH"),
+           "theme": os.environ.get("CLAUDE_USAGE_THEME")}
     cfg = resolve_runtime_config(cli, env, load_config())
     interval = cfg["interval"]
     extras_interval = cfg["extras_interval"]
@@ -1633,6 +1726,8 @@ def main():
     persist = cfg["persist"]
     history_path = cfg["history_path"]
     history_max = cfg["history_max"]
+
+    apply_theme(cfg["theme"])  # bind the palette before anything renders
 
     cookie = get_cookie(args.cookie, cookie_source)
 
