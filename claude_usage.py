@@ -333,6 +333,25 @@ def resolve_runtime_config(cli, env, cfg):
     history_path = resolve_setting(cli.get("history_path"), env.get("history_path"),
                                    cfg.get("history_path"), None) or default_history_path()
     history_path = os.path.expanduser(history_path)  # honor a ~ in config/env
+    # Alerting. Thresholds come from the config's `[alert]` table only (there's
+    # no sensible flat CLI/env spelling for a per-limit map); a single
+    # --alert-threshold / env value overrides every label at once by moving the
+    # "default" and dropping the per-label entries.
+    alerts_on = resolve_setting(_coerce_bool(cli.get("alerts")),
+                                _coerce_bool(env.get("alerts")),
+                                _coerce_bool(cfg.get("alerts")), True)
+    thresholds = normalize_thresholds(cfg.get("alert"))
+    blanket = resolve_setting(_coerce_int(cli.get("alert_threshold")),
+                              _coerce_int(env.get("alert_threshold")), None, None)
+    if blanket is not None:
+        thresholds = {"default": blanket}
+    notifier = resolve_setting(cli.get("alert_notifier"), env.get("alert_notifier"),
+                               cfg.get("alert_notifier"), "auto")
+    if notifier not in ALERT_NOTIFIERS:
+        notifier = "auto"
+    alert_state_path = resolve_setting(
+        cli.get("alert_state_path"), env.get("alert_state_path"),
+        cfg.get("alert_state_path"), None) or default_alert_state_path(history_path)
     return {
         "interval": interval,
         # Never poll extras faster than the core clock — a big -n implies
@@ -345,6 +364,12 @@ def resolve_runtime_config(cli, env, cfg):
         "history_path": history_path,
         # retention cap: max snapshots kept (0 = unlimited).
         "history_max": max(0, i("history_max", 0)),
+        "alerts": alerts_on,
+        "alert_thresholds": thresholds,
+        "alert_notifier": notifier,
+        # 0 = fire once per crossing (never re-nag until the limit resets).
+        "alert_cooldown": max(0, i("alert_cooldown", 0)),
+        "alert_state_path": os.path.expanduser(alert_state_path),
     }
 
 # ── Endpoints ─────────────────────────────────────────────────────────
@@ -1296,10 +1321,228 @@ def read_history(path):
     return out
 
 
+# ── Threshold alerting ────────────────────────────────────────────────
+# Warn *before* a limit is hit. The decision is a pure function over
+# (snapshot, thresholds, previous state) so every firing rule is provable
+# offline; dispatch is a thin, mockable shell-out that can never take the poll
+# down with it. Firing state persists next to the history file so a stateless
+# cron `--once` still fires once per crossing instead of on every run.
+
+# Per-limit percentages that trigger an alert. Keys are limit labels as they
+# appear on screen / in a snapshot ("5-hour", "7-day", "Opus 7d", …); "default"
+# covers every label without an explicit entry. Config overrides these.
+DEFAULT_ALERT_THRESHOLDS = {"default": 80, "5-hour": 80, "7-day": 90}
+
+# Config/CLI spellings the user may reasonably reach for, mapped onto the real
+# labels, so `[alert] "5h" = 70` works as well as `"5-hour" = 70`.
+ALERT_LABEL_ALIASES = {
+    "5h": "5-hour", "five_hour": "5-hour", "session": "5-hour",
+    "7d": "7-day", "seven_day": "7-day", "weekly": "7-day", "weekly_all": "7-day",
+}
+
+ALERT_NOTIFIERS = ("auto", "notify-send", "stdout", "none")
+
+
+def normalize_thresholds(raw):
+    """Config `[alert]` table -> {label: int}. Aliases are folded onto the real
+    labels, non-numeric values are dropped (a typo shouldn't wedge alerting),
+    and the built-in defaults fill in whatever the user didn't set."""
+    out = dict(DEFAULT_ALERT_THRESHOLDS)
+    for key, val in (raw or {}).items():
+        pct = _coerce_int(val)
+        if pct is None:
+            continue
+        label = ALERT_LABEL_ALIASES.get(str(key).strip().lower(), str(key))
+        out[label] = pct
+    return out
+
+
+def threshold_for(label, thresholds):
+    """The threshold that applies to one limit label, falling back to
+    'default' and finally to the built-in default."""
+    if label in thresholds:
+        return thresholds[label]
+    return thresholds.get("default", DEFAULT_ALERT_THRESHOLDS["default"])
+
+
+def _parse_ts(iso):
+    """ISO timestamp -> epoch seconds, or None. Tolerates a trailing 'Z'."""
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def evaluate_alerts(snap, thresholds, state, cooldown=0):
+    """Pure alert decision. Returns (alerts, new_state).
+
+    An alert fires when a limit's percentage first reaches its threshold. It
+    does NOT re-fire while the limit stays above that threshold — the crossing
+    is recorded in `state` and only cleared when the limit drops back below
+    (a reset), or when the configured threshold itself changes. A non-zero
+    `cooldown` (seconds) re-arms a still-elevated limit after that long, for
+    people who want to be nagged; the default 0 means once per crossing.
+
+    `state` is a {label: {"threshold": int, "ts": iso}} dict and is never
+    mutated in place — the caller persists the returned copy."""
+    state = dict(state or {})
+    now = _parse_ts(snap.get("ts")) if isinstance(snap, dict) else None
+    alerts = []
+    for lim in (snap or {}).get("limits") or []:
+        label = lim.get("label")
+        pct = lim.get("pct")
+        if label is None or pct is None:
+            continue
+        thr = threshold_for(label, thresholds)
+        prev = state.get(label) or {}
+        if pct < thr:
+            state.pop(label, None)  # dropped back below (or reset): re-arm
+            continue
+        # At or above the threshold. Fire unless we already did for this same
+        # threshold and the cooldown (if any) hasn't elapsed.
+        fired_thr = prev.get("threshold")
+        if fired_thr == thr:
+            if not cooldown:
+                continue
+            since = _parse_ts(prev.get("ts"))
+            if now is None or since is None or now - since < cooldown:
+                continue
+        alerts.append({
+            "label": label,
+            "pct": pct,
+            "threshold": thr,
+            "resets_at": lim.get("resets_at"),
+            "ts": snap.get("ts"),
+        })
+        state[label] = {"threshold": thr, "ts": snap.get("ts")}
+    return alerts, state
+
+
+def alert_message(alert):
+    """One-line human text for an alert. Shared by every notifier so the
+    desktop popup and the stdout line always say the same thing."""
+    msg = (f"{alert['label']} usage at {alert['pct']:.0f}% "
+           f"(threshold {alert['threshold']}%)")
+    iso = alert.get("resets_at")
+    return f"{msg} — resets in {fmt_reset(iso)}" if iso else msg
+
+
+def resolve_notifier(choice, which=shutil.which):
+    """'auto' -> 'notify-send' when libnotify is installed, else 'stdout'.
+    `which` is injectable so the tests don't depend on the host's PATH."""
+    if choice not in ALERT_NOTIFIERS:
+        choice = "auto"
+    if choice != "auto":
+        return choice
+    return "notify-send" if which("notify-send") else "stdout"
+
+
+def dispatch(alert, notifier="auto", runner=None, allow_stdout=True):
+    """Deliver one alert. Best-effort by design: a missing or broken notifier
+    must never raise into — or hang — the poll loop, so the subprocess is
+    time-boxed and every failure degrades to the stdout line. Returns the
+    notifier that actually delivered it ('none' if suppressed).
+
+    `allow_stdout=False` is what the live dashboard uses: printing a line into
+    a fixed-height redraw would corrupt the frame, and the panel is already
+    showing the percentage that triggered the alert."""
+    kind = resolve_notifier(notifier)
+    text = alert_message(alert)
+    if kind == "none":
+        return "none"
+    if kind == "notify-send":
+        run = runner or _run_notify_send
+        try:
+            if run(alert, text):
+                return "notify-send"
+        except Exception:  # noqa: BLE001 — notifying is never worth a crash
+            pass
+    if not allow_stdout:
+        return "none"
+    print(f"claude-usage: {text}")
+    return "stdout"
+
+
+def dispatch_quiet(alert, notifier="auto"):
+    """`dispatch` with the stdout fallback disabled — for the live dashboard."""
+    return dispatch(alert, notifier, allow_stdout=False)
+
+
+def _run_notify_send(alert, text):
+    """Shell out to libnotify. Urgency escalates once a limit is nearly spent.
+    Time-boxed so a wedged notification daemon can't stall the dashboard."""
+    import subprocess
+    urgency = "critical" if alert["pct"] >= 95 else "normal"
+    subprocess.run(
+        ["notify-send", "-a", "claude-usage", "-u", urgency,
+         "Claude usage warning", text],
+        check=True, timeout=5,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
+def default_alert_state_path(history_path):
+    """Firing state lives beside the history file (same dir, alerts.json) so
+    the two move together when `history_path` is overridden."""
+    parent = os.path.dirname(history_path)
+    # A bare relative history path keeps a bare state path (no "./" prefix),
+    # matching append_history's handling of the same case.
+    return os.path.join(parent, "alerts.json") if parent else "alerts.json"
+
+
+def read_alert_state(path):
+    """Persisted firing state, or {} for a missing/corrupt file — a bad state
+    file must degrade to 'nothing has fired yet', never to a crash."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+
+def write_alert_state(path, state):
+    """Persist firing state atomically (write + rename), so a crash mid-write
+    can't leave a truncated file that re-fires every alert."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def process_alerts(snap, cfg, dispatcher=dispatch):
+    """Evaluate + deliver + persist, in one best-effort call shared by the live
+    loop and `--once`. Returns the list of alerts that fired (empty when
+    alerting is off or anything went wrong)."""
+    if not cfg.get("alerts"):
+        return []
+    path = cfg["alert_state_path"]
+    try:
+        state = read_alert_state(path)
+        alerts, new_state = evaluate_alerts(
+            snap, cfg["alert_thresholds"], state, cfg["alert_cooldown"])
+        if new_state != state:
+            write_alert_state(path, new_state)
+    except OSError:  # state unreadable/unwritable — don't take the poll down
+        return []
+    for a in alerts:
+        dispatcher(a, cfg["alert_notifier"])
+    return alerts
+
+
 def run_once(cookie, cfg, print_snap=False):
     """Headless single-shot: fetch one reading, append a snapshot to history,
-    optionally echo it, and return a process exit code (0 ok, 1 on failure).
-    Silent by default so it's clean in a crontab; --print echoes the JSON."""
+    optionally echo it, and return a process exit code. Silent by default so
+    it's clean in a crontab; --print echoes the JSON.
+
+    Exit codes: 0 = fine, 1 = fetch/persist failed, 2 = a threshold alert
+    fired. A cron wrapper can act on 2 alone without treating a transient
+    network blip as a usage warning."""
     global BOOT
     BOOT = fetch_bootstrap(cookie)
     org = resolve_org(cfg["org"], BOOT, cookie)
@@ -1318,7 +1561,7 @@ def run_once(cookie, cfg, print_snap=False):
             return 1
     if print_snap:
         print(json.dumps(snap, separators=(",", ":")))
-    return 0
+    return 2 if process_alerts(snap, cfg) else 0
 
 
 def main():
@@ -1350,20 +1593,38 @@ def main():
                     help="don't write snapshots to the history file")
     ap.add_argument("--history-path", default=None,
                     help="override the history file location")
+    ap.add_argument("--no-alerts", dest="alerts", action="store_const",
+                    const=False, default=None,
+                    help="don't warn when a limit crosses its threshold")
+    ap.add_argument("--alert-threshold", type=int, default=None,
+                    help="warn at this percent for EVERY limit, overriding "
+                         "the per-limit [alert] config table")
+    ap.add_argument("--alert-notifier", choices=ALERT_NOTIFIERS, default=None,
+                    help="how to deliver alerts [auto: notify-send if present, "
+                         "else stdout]")
+    ap.add_argument("--alert-state-path", default=None,
+                    help="override where once-per-crossing state is stored")
     args = ap.parse_args()
 
     # Precedence: CLI flag > env var > config file > built-in default.
     cli = {"interval": args.interval, "extras_interval": args.extras_interval,
            "bootstrap_interval": args.bootstrap_interval, "org": args.org,
            "cookie_source": args.cookie_source, "persist": args.persist,
-           "history_path": args.history_path}
+           "history_path": args.history_path, "alerts": args.alerts,
+           "alert_threshold": args.alert_threshold,
+           "alert_notifier": args.alert_notifier,
+           "alert_state_path": args.alert_state_path}
     env = {"interval": os.environ.get("CLAUDE_USAGE_INTERVAL"),
            "extras_interval": os.environ.get("CLAUDE_USAGE_EXTRAS_INTERVAL"),
            "bootstrap_interval": os.environ.get("CLAUDE_USAGE_BOOTSTRAP_INTERVAL"),
            "org": os.environ.get("CLAUDE_ORG_ID"),
            "cookie_source": os.environ.get("CLAUDE_USAGE_COOKIE_SOURCE"),
            "persist": os.environ.get("CLAUDE_USAGE_PERSIST"),
-           "history_path": os.environ.get("CLAUDE_USAGE_HISTORY_PATH")}
+           "history_path": os.environ.get("CLAUDE_USAGE_HISTORY_PATH"),
+           "alerts": os.environ.get("CLAUDE_USAGE_ALERTS"),
+           "alert_threshold": os.environ.get("CLAUDE_USAGE_ALERT_THRESHOLD"),
+           "alert_notifier": os.environ.get("CLAUDE_USAGE_ALERT_NOTIFIER"),
+           "alert_state_path": os.environ.get("CLAUDE_USAGE_ALERT_STATE_PATH")}
     cfg = resolve_runtime_config(cli, env, load_config())
     interval = cfg["interval"]
     extras_interval = cfg["extras_interval"]
@@ -1470,6 +1731,11 @@ def main():
                 if cache and not err:
                     try:
                         snap = snapshot(cache)
+                        # Alerts are evaluated on every clean reading (not only
+                        # changed ones): re-firing is already suppressed by the
+                        # persisted crossing state, and this way a threshold
+                        # edited mid-run takes effect on the next tick.
+                        process_alerts(snap, cfg, dispatch_quiet)
                         if not same_reading(snap, last_snap):
                             last_snap = snap
                             hist_recent.append(snap)
