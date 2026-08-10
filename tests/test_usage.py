@@ -457,6 +457,272 @@ def test_run_once_persists(mod):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ── Phase 6: threshold alerting + notifications ───────────────────────
+
+def _snap(pct_5h, pct_7d, ts="2026-08-07T14:00:00+00:00"):
+    """A minimal snapshot with just the two headline limits."""
+    return {"ts": ts, "limits": [
+        {"label": "5-hour", "pct": pct_5h, "resets_at": None},
+        {"label": "7-day", "pct": pct_7d, "resets_at": None},
+    ], "spend": {}}
+
+
+def test_normalize_thresholds(mod):
+    """Aliases fold onto real labels; junk is dropped; defaults fill the rest."""
+    t = mod.normalize_thresholds({"5h": 70, "seven_day": 95, "Opus 7d": "50",
+                                  "bogus": "not-a-number"})
+    assert t["5-hour"] == 70
+    assert t["7-day"] == 95
+    assert t["Opus 7d"] == 50          # numeric string coerces
+    assert "bogus" not in t            # unparseable value dropped entirely
+    assert t["default"] == mod.DEFAULT_ALERT_THRESHOLDS["default"]
+    # No config at all ⇒ exactly the built-in defaults.
+    assert mod.normalize_thresholds(None) == mod.DEFAULT_ALERT_THRESHOLDS
+    assert mod.normalize_thresholds({}) == mod.DEFAULT_ALERT_THRESHOLDS
+
+
+def test_threshold_for(mod):
+    t = {"default": 80, "7-day": 90}
+    assert mod.threshold_for("7-day", t) == 90
+    assert mod.threshold_for("Sonnet 7d", t) == 80   # falls back to default
+    assert mod.threshold_for("x", {}) == mod.DEFAULT_ALERT_THRESHOLDS["default"]
+
+
+def test_evaluate_alerts_fires_at_threshold(mod):
+    """Below ⇒ silence. At/above ⇒ exactly one alert, with the right numbers."""
+    t = {"default": 80, "5-hour": 80, "7-day": 90}
+    alerts, state = mod.evaluate_alerts(_snap(42.5, 88.0), t, {})
+    assert alerts == [] and state == {}          # 42.5<80 and 88<90
+    alerts, state = mod.evaluate_alerts(_snap(80.0, 88.0), t, {})
+    assert [a["label"] for a in alerts] == ["5-hour"]   # boundary is inclusive
+    assert alerts[0]["threshold"] == 80 and alerts[0]["pct"] == 80.0
+    assert state == {"5-hour": {"threshold": 80, "ts": "2026-08-07T14:00:00+00:00"}}
+    # Both over ⇒ both fire, in limit order.
+    alerts, _ = mod.evaluate_alerts(_snap(95.0, 99.0), t, {})
+    assert [a["label"] for a in alerts] == ["5-hour", "7-day"]
+
+
+def test_evaluate_alerts_does_not_refire(mod):
+    """A crossing fires once and stays quiet until the limit drops back."""
+    t = {"default": 80}
+    alerts, state = mod.evaluate_alerts(_snap(85.0, 10.0), t, {})
+    assert len(alerts) == 1
+    # Still elevated (and climbing) ⇒ no second alert, state unchanged.
+    again, state2 = mod.evaluate_alerts(_snap(91.0, 10.0), t, state)
+    assert again == [] and state2 == state
+    # Limit resets below the threshold ⇒ state clears (re-armed)…
+    cleared, state3 = mod.evaluate_alerts(_snap(3.0, 10.0), t, state2)
+    assert cleared == [] and state3 == {}
+    # …and the next crossing fires again.
+    refired, _ = mod.evaluate_alerts(_snap(80.0, 10.0), t, state3)
+    assert len(refired) == 1
+
+
+def test_evaluate_alerts_rearms_on_threshold_change(mod):
+    """Lowering the threshold under a still-elevated limit fires afresh."""
+    _, state = mod.evaluate_alerts(_snap(85.0, 0.0), {"default": 80}, {})
+    alerts, state2 = mod.evaluate_alerts(_snap(85.0, 0.0), {"default": 70}, state)
+    assert [a["threshold"] for a in alerts] == [70]
+    assert state2["5-hour"]["threshold"] == 70
+
+
+def test_evaluate_alerts_cooldown(mod):
+    """cooldown>0 re-nags a still-elevated limit only after it has elapsed."""
+    t = {"default": 80}
+    _, state = mod.evaluate_alerts(_snap(85.0, 0.0, "2026-08-07T14:00:00+00:00"),
+                                   t, {}, cooldown=3600)
+    # 30 min later: inside the cooldown, silent.
+    early, _ = mod.evaluate_alerts(_snap(86.0, 0.0, "2026-08-07T14:30:00+00:00"),
+                                   t, state, cooldown=3600)
+    assert early == []
+    # 61 min later: re-fires, and the state timestamp advances.
+    late, state2 = mod.evaluate_alerts(_snap(86.0, 0.0, "2026-08-07T15:01:00+00:00"),
+                                       t, state, cooldown=3600)
+    assert len(late) == 1
+    assert state2["5-hour"]["ts"] == "2026-08-07T15:01:00+00:00"
+
+
+def test_evaluate_alerts_ignores_junk(mod):
+    """Malformed limit entries are skipped, not crashed on."""
+    snap = {"ts": "2026-08-07T14:00:00+00:00", "limits": [
+        {"label": None, "pct": 99}, {"label": "x"}, {"pct": 99},
+        {"label": "5-hour", "pct": 99.0}]}
+    alerts, _ = mod.evaluate_alerts(snap, {"default": 80}, {})
+    assert [a["label"] for a in alerts] == ["5-hour"]
+    # No snapshot / no limits at all ⇒ empty, and state is left untouched.
+    assert mod.evaluate_alerts({}, {"default": 80}, {"a": 1}) == ([], {"a": 1})
+    # The caller's state dict is never mutated in place.
+    st = {}
+    mod.evaluate_alerts(_snap(99.0, 0.0), {"default": 80}, st)
+    assert st == {}
+
+
+def test_alert_message(mod):
+    a = {"label": "7-day", "pct": 91.4, "threshold": 90, "resets_at": None}
+    assert mod.alert_message(a) == "7-day usage at 91% (threshold 90%)"
+    # With a reset time, the message says when it clears (frozen clock).
+    a2 = dict(a, resets_at="2026-08-12T00:00:00Z")
+    assert mod.alert_message(a2).startswith(
+        "7-day usage at 91% (threshold 90%) — resets in 4d")
+
+
+def test_resolve_notifier(mod):
+    assert mod.resolve_notifier("auto", which=lambda p: "/usr/bin/notify-send") \
+        == "notify-send"
+    assert mod.resolve_notifier("auto", which=lambda p: None) == "stdout"
+    assert mod.resolve_notifier("stdout", which=lambda p: "/x") == "stdout"
+    assert mod.resolve_notifier("none", which=lambda p: "/x") == "none"
+    assert mod.resolve_notifier("garbage", which=lambda p: None) == "stdout"
+
+
+def test_dispatch_uses_mocked_runner(mod):
+    """dispatch never shells out in tests: the runner is injected."""
+    import io, contextlib
+    alert = {"label": "5-hour", "pct": 96.0, "threshold": 80, "resets_at": None}
+    seen = []
+
+    def ok(a, text):
+        seen.append((a["label"], text))
+        return True
+    assert mod.dispatch(alert, "notify-send", runner=ok) == "notify-send"
+    assert seen[0][0] == "5-hour" and "96%" in seen[0][1]
+
+    # A broken notifier degrades to stdout rather than raising.
+    def boom(a, text):
+        raise OSError("no dbus")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert mod.dispatch(alert, "notify-send", runner=boom) == "stdout"
+    assert "5-hour usage at 96%" in buf.getvalue()
+
+    # …unless stdout is suppressed (the live dashboard's fixed-height redraw).
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert mod.dispatch(alert, "notify-send", runner=boom,
+                            allow_stdout=False) == "none"
+        assert mod.dispatch_quiet(alert, "stdout") == "none"
+    assert buf.getvalue() == ""
+
+    # 'none' suppresses entirely and never touches the runner.
+    seen.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert mod.dispatch(alert, "none", runner=ok) == "none"
+    assert seen == [] and buf.getvalue() == ""
+
+
+def test_alert_state_roundtrip(mod):
+    import tempfile, shutil
+    d = tempfile.mkdtemp()
+    try:
+        path = os.path.join(d, "sub", "alerts.json")
+        assert mod.read_alert_state(path) == {}       # missing file
+        state = {"5-hour": {"threshold": 80, "ts": "2026-08-07T14:00:00+00:00"}}
+        mod.write_alert_state(path, state)            # creates parent dirs
+        assert mod.read_alert_state(path) == state
+        # A corrupt state file degrades to "nothing fired", not a crash.
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        assert mod.read_alert_state(path) == {}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_default_alert_state_path(mod):
+    assert mod.default_alert_state_path("/a/b/history.jsonl") == "/a/b/alerts.json"
+    assert mod.default_alert_state_path("history.jsonl") == "alerts.json"
+
+
+def test_alert_settings_precedence(mod):
+    """CLI > env > config for every alert setting; thresholds come from
+    the config's [alert] table, and a blanket override replaces it wholesale."""
+    cfg = {"alerts": True, "alert_notifier": "stdout", "alert_cooldown": 60,
+           "alert": {"5h": 70, "7-day": 95}}
+    r = mod.resolve_runtime_config({}, {}, cfg)
+    assert r["alerts"] is True
+    assert r["alert_notifier"] == "stdout"
+    assert r["alert_cooldown"] == 60
+    assert r["alert_thresholds"]["5-hour"] == 70
+    assert r["alert_thresholds"]["7-day"] == 95
+    # Defaults with no config at all.
+    d = mod.resolve_runtime_config({}, {}, {})
+    assert d["alerts"] is True and d["alert_notifier"] == "auto"
+    assert d["alert_cooldown"] == 0
+    assert d["alert_thresholds"] == mod.DEFAULT_ALERT_THRESHOLDS
+    assert d["alert_state_path"] == mod.default_alert_state_path(d["history_path"])
+    # Env beats config; CLI beats env. An invalid notifier falls back to auto.
+    e = mod.resolve_runtime_config({}, {"alerts": "false",
+                                        "alert_notifier": "bogus"}, cfg)
+    assert e["alerts"] is False and e["alert_notifier"] == "auto"
+    c = mod.resolve_runtime_config({"alerts": True, "alert_notifier": "none",
+                                    "alert_threshold": 50},
+                                   {"alerts": "false"}, cfg)
+    assert c["alerts"] is True and c["alert_notifier"] == "none"
+    assert c["alert_thresholds"] == {"default": 50}   # blanket wipes per-limit
+    # An explicit state path wins and is ~-expanded.
+    p = mod.resolve_runtime_config({"alert_state_path": "~/s.json"}, {}, {})
+    assert p["alert_state_path"] == os.path.expanduser("~/s.json")
+
+
+def test_process_alerts_persists_state(mod):
+    """End-to-end: fires once, persists the crossing, stays quiet after."""
+    import tempfile, shutil
+    d = tempfile.mkdtemp()
+    try:
+        cfg = {"alerts": True, "alert_thresholds": {"default": 80},
+               "alert_notifier": "stdout", "alert_cooldown": 0,
+               "alert_state_path": os.path.join(d, "alerts.json")}
+        sent = []
+        fired = mod.process_alerts(_snap(85.0, 10.0), cfg,
+                                   lambda a, n: sent.append((a["label"], n)))
+        assert [a["label"] for a in fired] == ["5-hour"]
+        assert sent == [("5-hour", "stdout")]
+        assert "5-hour" in mod.read_alert_state(cfg["alert_state_path"])
+        # A second process (fresh call, state read from disk) doesn't re-fire.
+        sent.clear()
+        assert mod.process_alerts(_snap(87.0, 10.0), cfg,
+                                  lambda a, n: sent.append(a)) == []
+        assert sent == []
+        # Alerting off ⇒ nothing evaluated, nothing dispatched.
+        off = dict(cfg, alerts=False)
+        assert mod.process_alerts(_snap(99.0, 99.0), off,
+                                  lambda a, n: sent.append(a)) == []
+        assert sent == []
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_once_exit_code_on_alert(mod):
+    """--once returns 2 when an alert fires, 0 once the crossing is recorded."""
+    import tempfile, shutil, io, contextlib
+    d = tempfile.mkdtemp()
+    try:
+        mod.fetch = lambda cookie, org: DATA          # 5-hour 42.5%, 7-day 88%
+        mod.fetch_bootstrap = lambda cookie: {"account": {"memberships": [
+            {"organization": {"uuid": "ORG"}}]}}
+        cfg = {"org": None, "persist": True,
+               "history_path": os.path.join(d, "history.jsonl"),
+               "history_max": 0, "alerts": True,
+               "alert_thresholds": {"default": 80}, "alert_notifier": "stdout",
+               "alert_cooldown": 0,
+               "alert_state_path": os.path.join(d, "alerts.json")}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mod.run_once("cookie", cfg)
+        assert rc == 2, rc                            # 7-day 88% >= 80
+        assert "7-day usage at 88%" in buf.getvalue()
+        # Same reading again: the crossing already fired, so a clean exit.
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert mod.run_once("cookie", cfg) == 0
+        # A fetch failure is still 1 — distinguishable from an alert.
+        def boom(cookie, org):
+            raise RuntimeError("network down")
+        mod.fetch = boom
+        assert mod.run_once("cookie", cfg) == 1
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     mod = load_module()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -36,6 +36,9 @@ with your existing browser session cookie — no API key, nothing to configure.
   live code sessions, and recent chats (large windows only).
 - **Warm "heat" gauge.** Bars shift from soft tan through Claude orange to rust
   red as a limit fills, so severity reads at a glance.
+- **Threshold alerts.** Configurable per-limit warning levels, delivered by
+  `notify-send` (or stdout), fired once per crossing — from the live dashboard
+  or a cron `--once` run.
 - **Resilient.** Every secondary endpoint is best-effort — one dead endpoint
   never blanks the panel. Cloudflare challenges and expired sessions are
   reported distinctly.
@@ -90,6 +93,10 @@ Keys, while running:
 | `--print`              | —       | With `--once`, also print the snapshot JSON.        |
 | `--no-persist`         | —       | Don't write snapshots to the history file.          |
 | `--history-path`       | —       | Override the history file location.                 |
+| `--no-alerts`          | —       | Don't warn when a limit crosses its threshold.       |
+| `--alert-threshold`    | —       | Warn at this percent for *every* limit.             |
+| `--alert-notifier`     | `auto`  | `auto`, `notify-send`, `stdout`, or `none`.         |
+| `--alert-state-path`   | —       | Override where once-per-crossing state is stored.   |
 
 ## History & headless mode
 
@@ -133,6 +140,45 @@ Trends are seeded from the history file at startup (so prior runs and cron
 They appear only in the full panel; smaller layouts show bars alone. The trend
 buffer works even with `--no-persist` (it just isn't written to disk).
 
+## Threshold alerts
+
+The point of watching a limit is to act *before* it runs out, so a limit that
+reaches its threshold raises an alert: a desktop notification via `notify-send`
+if libnotify is installed, otherwise a line on stdout.
+
+Defaults are 80% for the 5-hour limit, 90% for the 7-day one, and 80% for
+anything else. Set your own per limit under `[alert]` in the config file, or
+override every limit at once with `--alert-threshold`:
+
+```toml
+[alert]
+"5-hour" = 70     # "5h" and "7d" work as aliases
+"7-day"  = 85
+"Opus 7d" = 90
+default  = 80     # anything without an entry of its own
+```
+
+An alert fires **once per crossing**. It won't repeat while the limit stays
+elevated; it re-arms when the limit drops back under its threshold (a reset),
+or when you change the threshold. Set `alert_cooldown` to be re-nagged every N
+seconds while a limit is still over.
+
+That state lives in `alerts.json` next to the history file, which is what lets
+a stateless cron `--once` run stay quiet after the first warning. `--once`
+exits **2** when an alert fired (**1** is a fetch/persist failure, **0** is
+fine), so a wrapper can act on the warning alone:
+
+```cron
+*/15 * * * * claude-usage --once || [ $? -ne 2 ] || echo "claude usage high" | mail -s alert me
+```
+
+In the live dashboard, alerts go to `notify-send` only — printing into the
+fixed-height redraw would corrupt the frame, and the panel is already showing
+the percentage that triggered it. Notification failures are always swallowed:
+a missing or wedged notification daemon can never stall or crash a poll.
+
+Turn the whole thing off with `--no-alerts` (or `alerts = false`).
+
 ## Configuration
 
 Every setting except `--cookie` (a secret, never read from disk) can be set in a
@@ -156,12 +202,28 @@ org = "your-org-uuid"
 persist = true
 history_path = "~/.local/share/claude-usage/history.jsonl"
 history_max = 0          # cap on records kept (0 = unlimited)
+
+# Alerting
+alerts = true
+alert_notifier = "auto"  # auto | notify-send | stdout | none
+alert_cooldown = 0       # 0 = fire once per crossing; N = re-nag every N s
+
+[alert]                  # per-limit thresholds, in percent
+"5-hour" = 70
+"7-day"  = 85
 ```
 
 Matching environment variables: `CLAUDE_USAGE_INTERVAL`,
 `CLAUDE_USAGE_EXTRAS_INTERVAL`, `CLAUDE_USAGE_BOOTSTRAP_INTERVAL`,
 `CLAUDE_USAGE_COOKIE_SOURCE`, `CLAUDE_USAGE_PERSIST`,
-`CLAUDE_USAGE_HISTORY_PATH`, and `CLAUDE_ORG_ID` (for `org`).
+`CLAUDE_USAGE_HISTORY_PATH`, `CLAUDE_USAGE_ALERTS`,
+`CLAUDE_USAGE_ALERT_THRESHOLD`, `CLAUDE_USAGE_ALERT_NOTIFIER`,
+`CLAUDE_USAGE_ALERT_STATE_PATH`, and `CLAUDE_ORG_ID` (for `org`).
+
+The `[alert]` threshold table is config-file-only — there's no sensible flat
+spelling for a per-limit map on the command line or in the environment.
+`--alert-threshold` / `CLAUDE_USAGE_ALERT_THRESHOLD` replaces the whole table
+with one blanket number.
 
 ## Authentication
 
