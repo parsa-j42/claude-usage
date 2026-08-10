@@ -866,6 +866,182 @@ def test_theme_setting_precedence(mod):
     assert mod.resolve_runtime_config({}, {}, {"theme": 42})["theme"] == "claude"
 
 
+# ── Phase 8: configurable sections + keyboard navigation ──────────────
+
+# Every headline the registry can emit, so a rendered panel can be read back as
+# a section list. `additional`/`extra_usage` need data that DATA alone lacks.
+SECTION_HEADERS = {
+    "limits": "LIMITS", "additional": "ADDITIONAL", "credits": "CREDITS",
+    "extra_usage": "EXTRA USAGE", "sessions": "SESSIONS",
+    "recent": "RECENT CHATS", "account": "ACCOUNT",
+    "connectors": "CONNECTORS", "cowork": "COWORK",
+}
+
+# DATA plus the two payload-driven optional sections.
+RICH = dict(DATA, extra_usage={"is_enabled": True, "used_credits": 3},
+            cowork_usage={"utilization": 12.0})
+
+
+def _panel(mod, data, sections=None, cols=100, rows=40, history=None):
+    """Render the big panel with the BOOT/LIVE-backed sections neutralized: the
+    standalone runner shares one module instance across tests, so an earlier
+    test's globals must not leak extra sections into this one."""
+    mod.BOOT, mod.LIVE = None, {}
+    mdef = mod.primary_metrics(data)
+    return mod.render(data, cols, rows, 120, mdef,
+                      HISTORY if history is None else history, sections)
+
+
+def _headers(mod, lines):
+    """The section names visible in a rendered panel, in render order."""
+    seen = []
+    for line in (l.strip() for l in _strip(lines)):
+        for name, head in SECTION_HEADERS.items():
+            # SESSIONS carries a live count — "SESSIONS (2)".
+            if line == head or line.startswith(head + " ("):
+                seen.append(name)
+    return seen
+
+
+def test_default_sections_render_like_before(mod):
+    """Passing the default order explicitly is identical to passing nothing —
+    the registry refactor is a pure restructure of the old hardcoded layout."""
+    implicit = _panel(mod, RICH)
+    explicit = _panel(mod, RICH, mod.DEFAULT_SECTIONS)
+    assert implicit == explicit
+    assert set(mod.DEFAULT_SECTIONS) == set(mod.PANEL_SECTIONS), (
+        "every registered section must appear in the default order")
+
+
+def test_sections_select_and_order_the_panel(mod):
+    """A `sections` list produces exactly those sections, in that order."""
+    for want in (["credits", "limits"],
+                 ["limits"],
+                 ["extra_usage", "credits", "additional", "limits"]):
+        lines = _panel(mod, RICH, want)
+        assert _headers(mod, lines) == want, want
+        assert len(lines) == 40
+
+
+def test_sections_omit_empty_and_unknown(mod):
+    """An empty section (no data) contributes nothing — not a stray blank
+    heading — and an unknown name is skipped rather than raising."""
+    # DATA carries no extra_usage payload, and BOOT/LIVE are empty.
+    lines = _panel(mod, DATA, ["limits", "extra_usage", "account", "credits"])
+    assert _headers(mod, lines) == ["limits", "credits"]
+    # An unrecognized name in the render list is ignored, not fatal.
+    lines = _panel(mod, DATA, ["limits", "nope"])
+    assert _headers(mod, lines) == ["limits"]
+
+
+def test_normalize_sections(mod):
+    d = tuple(mod.DEFAULT_SECTIONS)
+    assert mod.normalize_sections(None) == d
+    assert mod.normalize_sections([]) == d            # empty ⇒ fall back
+    assert mod.normalize_sections("bogus, nope") == d  # all-unknown ⇒ fall back
+    assert mod.normalize_sections(42) == d             # wrong type ⇒ fall back
+    assert mod.normalize_sections("credits,limits") == ("credits", "limits")
+    assert mod.normalize_sections(" Credits  limits ") == ("credits", "limits")
+    assert mod.normalize_sections(["limits", "limits"]) == ("limits",)  # dedup
+    assert mod.normalize_sections(["limits", "junk", 7]) == ("limits",)
+
+
+def test_sections_setting_precedence(mod):
+    assert mod.resolve_runtime_config({}, {}, {})["sections"] == \
+        tuple(mod.DEFAULT_SECTIONS)
+    assert mod.resolve_runtime_config({}, {}, {"sections": ["limits", "credits"]}
+                                      )["sections"] == ("limits", "credits")
+    assert mod.resolve_runtime_config({}, {"sections": "credits"},
+                                      {"sections": ["limits"]}
+                                      )["sections"] == ("credits",)
+    assert mod.resolve_runtime_config({"sections": "account"},
+                                      {"sections": "credits"},
+                                      {"sections": ["limits"]}
+                                      )["sections"] == ("account",)
+    # Garbage anywhere degrades to the full default panel.
+    assert mod.resolve_runtime_config({}, {}, {"sections": ["nope"]}
+                                      )["sections"] == tuple(mod.DEFAULT_SECTIONS)
+
+
+def test_initial_key_state(mod):
+    cfg = mod.resolve_runtime_config({}, {}, {"sections": ["limits", "credits"],
+                                              "theme": "mono"})
+    st = mod.initial_key_state(cfg)
+    assert st["running"] and st["force"]        # first tick fetches immediately
+    assert st["theme"] == "mono"
+    assert st["sections"] == ("limits", "credits")
+    assert st["hidden"] == frozenset() and st["compact"] is False
+
+
+def test_handle_key_refresh_and_quit(mod):
+    st = mod.initial_key_state({})
+    for key in ("r", "R", " "):
+        assert mod.handle_key(st, key)["force"] is True, key
+    for key in ("q", "Q", "\x03", "\x04"):
+        assert mod.handle_key(st, key)["running"] is False, key
+    # Unknown keys are inert, and clear a stale force flag.
+    after = mod.handle_key(mod.handle_key(st, "r"), "z")
+    assert after["force"] is False and after["running"] is True
+
+
+def test_handle_key_is_pure(mod):
+    st = mod.initial_key_state({})
+    before = dict(st)
+    for key in ("t", "s", "1", "q", " "):
+        out = mod.handle_key(st, key)
+        assert st == before, f"handle_key mutated its input on {key!r}"
+        assert out is not st
+
+
+def test_handle_key_cycles_theme(mod):
+    order = sorted(mod.THEMES)
+    st = mod.initial_key_state({"theme": order[0]})
+    seen = []
+    for _ in order:
+        st = mod.handle_key(st, "t")
+        seen.append(st["theme"])
+    assert seen == order[1:] + [order[0]], seen  # wraps around
+    # An unknown current theme starts the cycle rather than raising.
+    assert mod.handle_key({"theme": "gone"}, "t")["theme"] == order[0]
+
+
+def test_handle_key_toggles_sections(mod):
+    st = mod.initial_key_state({"sections": ["limits", "credits", "account"]})
+    assert mod.visible_sections(st) == ("limits", "credits", "account")
+
+    st = mod.handle_key(st, "2")                     # hide the 2nd section
+    assert st["hidden"] == frozenset({"credits"})
+    assert mod.visible_sections(st) == ("limits", "account")
+    st = mod.handle_key(st, "2")                     # …and show it again
+    assert mod.visible_sections(st) == ("limits", "credits", "account")
+    # Out-of-range digits are inert; the configured order is never rewritten.
+    st = mod.handle_key(st, "9")
+    assert st["hidden"] == frozenset()
+    assert st["sections"] == ("limits", "credits", "account")
+
+
+def test_handle_key_compact_toggle(mod):
+    st = mod.initial_key_state({})
+    st = mod.handle_key(st, "s")
+    assert st["compact"] is True
+    assert mod.visible_sections(st) == tuple(mod.CORE_SECTIONS)
+    assert mod.handle_key(st, "s")["compact"] is False
+    # Compact and per-section hiding compose.
+    both = mod.handle_key(st, "1")
+    assert "limits" not in mod.visible_sections(both)
+
+
+def test_visible_sections_drives_the_panel(mod):
+    """The whole key→panel path: toggles change which sections actually render."""
+    st = mod.initial_key_state({"sections": ["limits", "credits", "additional"]})
+    lines = _panel(mod, RICH, mod.visible_sections(st))
+    assert _headers(mod, lines) == ["limits", "credits", "additional"]
+    st = mod.handle_key(st, "2")
+    lines = _panel(mod, RICH, mod.visible_sections(st))
+    assert _headers(mod, lines) == ["limits", "additional"]
+    assert len(lines) == 40
+
+
 def main():
     mod = load_module()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

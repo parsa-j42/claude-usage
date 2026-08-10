@@ -37,6 +37,9 @@ with your existing browser session cookie — no API key, nothing to configure.
 - **Warm "heat" gauge.** Bars shift from soft tan through Claude orange to rust
   red as a limit fills, so severity reads at a glance — or pick another of the
   four themes (`cool`, `mono`, `contrast`) with `--theme`.
+- **Your panel, your order.** Choose which big-panel sections appear and in
+  what order (`--sections`, or `sections = [...]` in the config), and toggle
+  them live from the keyboard.
 - **Threshold alerts.** Configurable per-limit warning levels, delivered by
   `notify-send` (or stdout), fired once per crossing — from the live dashboard
   or a cron `--once` run.
@@ -75,10 +78,16 @@ claude-usage -n 30        # refresh core usage every 30s
 
 Keys, while running:
 
-| Key            | Action        |
-| -------------- | ------------- |
-| `r` / `space`  | refresh now   |
-| `q` / `Ctrl-C` | quit          |
+| Key            | Action                                                  |
+| -------------- | ------------------------------------------------------- |
+| `r` / `space`  | refresh now                                             |
+| `t`            | cycle to the next color theme                           |
+| `s`            | toggle "just the numbers" (hide all but limits/credits) |
+| `1`…`9`        | show/hide the Nth panel section                         |
+| `q` / `Ctrl-C` | quit                                                    |
+
+`t`, `s` and the digit keys affect the big panel only, and are not persisted —
+put a lasting choice in the config file (`theme`, `sections`).
 
 ### Options
 
@@ -99,6 +108,7 @@ Keys, while running:
 | `--alert-notifier`     | `auto`  | `auto`, `notify-send`, `stdout`, or `none`.         |
 | `--alert-state-path`   | —       | Override where once-per-crossing state is stored.   |
 | `--theme`              | `claude`| Color theme: `claude`, `cool`, `mono`, `contrast`.  |
+| `--sections`           | all     | Panel sections to show, in order (comma-separated). |
 
 ## History & headless mode
 
@@ -163,6 +173,36 @@ The default is unchanged from before themes existed — byte for byte, and there
 a test pinning it to a golden hash so it stays that way. An unrecognized theme
 name falls back to the default rather than refusing to start.
 
+## Panel sections
+
+The big panel (≥46×20) is composed from named sections. By default all of them
+render, in this order:
+
+| Name           | What it shows                                          |
+| -------------- | ------------------------------------------------------ |
+| `limits`       | Session/weekly limit bars, resets, trend sparklines     |
+| `additional`   | Model-scoped / cowork / host buckets, when present      |
+| `credits`      | Spend, balance, cap, credit toggles                     |
+| `extra_usage`  | Extra-usage status and utilization, when present        |
+| `sessions`     | Live code sessions                                      |
+| `recent`       | Recent chats                                            |
+| `account`      | Name, org, rate tier, billing                           |
+| `connectors`   | Web search / Drive / MCP-style toggles                  |
+| `cowork`       | Cowork setup status                                     |
+
+Pick a subset — and an order — with the flag, the environment variable, or the
+config file:
+
+```bash
+claude-usage --sections limits,credits,sessions
+CLAUDE_USAGE_SECTIONS="limits,credits" claude-usage
+```
+
+A section with nothing to show is skipped silently, so a slimmer panel is safe
+to configure. Unknown names are ignored, and a list that ends up empty falls
+back to the full default order rather than rendering a blank panel. Smaller
+layouts don't use sections at all — they always show the limit bars.
+
 ## Threshold alerts
 
 The point of watching a limit is to act *before* it runs out, so a limit that
@@ -221,6 +261,11 @@ bootstrap_interval = 0
 cookie_source = "firefox"
 org = "your-org-uuid"
 theme = "claude"         # claude | cool | mono | contrast
+
+# Big-panel sections: which blocks show, and in what order. Omit the key for
+# all of them in the default order. Unknown names are ignored.
+sections = ["limits", "additional", "credits", "extra_usage",
+            "sessions", "recent", "account", "connectors", "cowork"]
 
 # History / persistence
 persist = true

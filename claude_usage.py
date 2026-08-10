@@ -443,6 +443,11 @@ def resolve_runtime_config(cli, env, cfg):
                             cfg.get("theme"), DEFAULT_THEME)
     if theme not in THEMES:
         theme = DEFAULT_THEME  # a stale name shouldn't stop the dash starting
+    # Panel sections: which big-panel blocks show, and in what order. A string
+    # (CLI/env, comma- or space-separated) or a TOML array both work; unknown
+    # names are dropped and an unusable list falls back to the default order.
+    sections = normalize_sections(resolve_setting(
+        cli.get("sections"), env.get("sections"), cfg.get("sections"), None))
     alert_state_path = resolve_setting(
         cli.get("alert_state_path"), env.get("alert_state_path"),
         cfg.get("alert_state_path"), None) or default_alert_state_path(history_path)
@@ -465,6 +470,7 @@ def resolve_runtime_config(cli, env, cfg):
         "alert_cooldown": max(0, i("alert_cooldown", 0)),
         "alert_state_path": os.path.expanduser(alert_state_path),
         "theme": theme,
+        "sections": sections,
     }
 
 # ── Endpoints ─────────────────────────────────────────────────────────
@@ -1148,57 +1154,74 @@ def trend_series(history, label, n=None):
     return out
 
 
-def render_panel(data, cols, rows, interval, history=None):
-    now = datetime.now()
-    lines = []
-    t = now.strftime("%-I:%M%p").lower()
-    lines.append(join_lr(f"{STAR} Claude Usage", f"{REFRESH} {t}", cols))
-    lines.append("")
-
-    # ── Limits ────────────────────────────────────────────────────────
-    # Build the label → pct-series map once per frame (not once per metric).
-    trend_map = history_index(history)
-    # The trend line's visible prefix is exactly 16 cols ("          trend ");
-    # cap the sparkline so the row never exceeds the panel width and wraps.
-    spark_w = max(1, cols - 16)
-
-    def bar_row(label, pct, iso, sev="normal"):
-        scol = SEV_COL.get(sev, GREY)
-        lab = label[:9]
-        pcell = f"{rgb(*heat(pct))}{BOLD}{fmt_pct(pct, decimals=True):>6}{R}"
-        bar_w = max(6, cols - 9 - 1 - 1 - 6)
-        lines.append(f"{CREAM}{lab:<9}{R} {progress_bar(pct, bar_w)} {pcell}")
-        if iso:
-            r = f"{RESET_GLYPH} {fmt_reset(iso)}"
-            badge = "" if sev == "normal" else f"  {scol}({sev}){R}"
-            lines.append(f"          {DIM}{GREY}{r}{R}{badge}")
-        # Trend sparkline — only once at least two samples exist for this metric,
-        # so it fills in as history accrues and never shows a lone dot.
-        series = trend_map.get(label, ())
-        if len(series) >= 2:
-            spark = sparkline(series, width=spark_w)
-            lines.append(f"          {DIM}{GREY}trend {CREAM}{spark}{R}")
-
+# ── Panel section registry ────────────────────────────────────────────
+# Each panel section is a function `fn(ctx) -> list[str]`, returning its own
+# lines (heading included) or [] when it has nothing to show. `render_panel`
+# looks the names up in PANEL_SECTIONS and emits them in the requested order,
+# separating non-empty ones with a single blank line — so the section list is
+# pure config (and the default order reproduces the pre-Phase-8 layout byte for
+# byte). ctx carries the per-frame values every section might need.
+def _panel_ctx(data, cols, history=None):
     limits = all_limits(data)
-    lines.append(_section("LIMITS"))
-    for lim in limits:
+    return {
+        "data": data or {},
+        "cols": cols,
+        "limits": limits,
+        "extras": extra_metrics(data, seen_labels=[l["full"] for l in limits]),
+        # Build the label → pct-series map once per frame (not once per metric).
+        "trend_map": history_index(history),
+        # The trend line's visible prefix is exactly 16 cols ("          trend ");
+        # cap the sparkline so the row never exceeds the panel width and wraps.
+        "spark_w": max(1, cols - 16),
+    }
+
+
+def _bar_rows(ctx, label, pct, iso, sev="normal"):
+    """The bar + reset + trend rows for one metric (shared by limits/extras)."""
+    cols = ctx["cols"]
+    out = []
+    scol = SEV_COL.get(sev, GREY)
+    lab = label[:9]
+    pcell = f"{rgb(*heat(pct))}{BOLD}{fmt_pct(pct, decimals=True):>6}{R}"
+    bar_w = max(6, cols - 9 - 1 - 1 - 6)
+    out.append(f"{CREAM}{lab:<9}{R} {progress_bar(pct, bar_w)} {pcell}")
+    if iso:
+        r = f"{RESET_GLYPH} {fmt_reset(iso)}"
+        badge = "" if sev == "normal" else f"  {scol}({sev}){R}"
+        out.append(f"          {DIM}{GREY}{r}{R}{badge}")
+    # Trend sparkline — only once at least two samples exist for this metric,
+    # so it fills in as history accrues and never shows a lone dot.
+    series = ctx["trend_map"].get(label, ())
+    if len(series) >= 2:
+        spark = sparkline(series, width=ctx["spark_w"])
+        out.append(f"          {DIM}{GREY}trend {CREAM}{spark}{R}")
+    return out
+
+
+def limits_section(ctx):
+    lines = [_section("LIMITS")]
+    for lim in ctx["limits"]:
         if not lim["active"] and lim["pct"] == 0:
             lines.append(f"{CREAM}{lim['full'][:9]:<9}{R} {DIM}{GREY}idle{R}")
             continue
-        bar_row(lim["full"], lim["pct"], lim["iso"], lim["severity"])
+        lines.extend(_bar_rows(ctx, lim["full"], lim["pct"], lim["iso"],
+                               lim["severity"]))
+    return lines
 
-    # ── Additional buckets (cowork, host, model-scoped, …) ────────────
-    extras = extra_metrics(data, seen_labels=[l["full"] for l in limits])
-    if extras:
-        lines.append("")
-        lines.append(_section("ADDITIONAL"))
-        for ex in extras:
-            bar_row(ex["full"], ex["pct"], ex["iso"])
-    lines.append("")
 
-    # ── Credits / spend ───────────────────────────────────────────────
-    sp = data.get("spend") or {}
-    lines.append(_section("CREDITS"))
+def additional_section(ctx):
+    """Additional buckets (cowork, host, model-scoped, …)."""
+    if not ctx["extras"]:
+        return []
+    lines = [_section("ADDITIONAL")]
+    for ex in ctx["extras"]:
+        lines.extend(_bar_rows(ctx, ex["full"], ex["pct"], ex["iso"]))
+    return lines
+
+
+def credits_section(ctx):
+    cols, sp = ctx["cols"], ctx["data"].get("spend") or {}
+    lines = [_section("CREDITS")]
     used = fmt_money(sp.get("used"))
     limit = fmt_money(sp.get("limit"))
     lines.append(_kv("Spent", f"{used} of {limit}", cols))
@@ -1215,40 +1238,97 @@ def render_panel(data, cols, rows, interval, history=None):
     if sp.get("can_purchase_credits") is not None:
         lines.append(_kv("Can purchase", "yes" if sp.get("can_purchase_credits")
                          else "no", cols))
+    return lines
 
-    # ── Extra usage ───────────────────────────────────────────────────
-    eu = data.get("extra_usage") or {}
-    if eu:
-        lines.append("")
-        lines.append(_section("EXTRA USAGE"))
-        if eu.get("is_enabled"):
-            util = eu.get("utilization")
-            lines.append(_kv("Status", "enabled", cols,
-                             vcol=ON_COL))
-            if eu.get("monthly_limit") is not None:
-                lines.append(_kv("Monthly limit",
-                                 fmt_money(eu.get("monthly_limit"))
-                                 if isinstance(eu.get("monthly_limit"), dict)
-                                 else str(eu.get("monthly_limit")), cols))
-            if eu.get("used_credits") is not None:
-                lines.append(_kv("Used credits", str(eu.get("used_credits")), cols))
-            if util is not None:
-                lines.append(_kv("Utilization", fmt_pct(float(util)), cols))
-        else:
-            reason = ("user disabled" if eu.get("user_disabled")
-                      else eu.get("disabled_reason") or "off")
-            lines.append(_kv("Status", reason, cols))
-            if eu.get("spend_limit_reached"):
-                lines.append(_kv("Spend limit",
-                                 "reached", cols, vcol=SEV_COL["critical"]))
 
-    # ── Live sessions / recent chats / account / connectors / cowork ──
-    for section in (sessions_section(cols), recent_section(cols),
-                    account_section(cols), connectors_section(cols),
-                    cowork_section(cols)):
-        if section:
-            lines.append("")
-            lines.extend(section)
+def extra_usage_section(ctx):
+    cols, eu = ctx["cols"], ctx["data"].get("extra_usage") or {}
+    if not eu:
+        return []
+    lines = [_section("EXTRA USAGE")]
+    if eu.get("is_enabled"):
+        util = eu.get("utilization")
+        lines.append(_kv("Status", "enabled", cols,
+                         vcol=ON_COL))
+        if eu.get("monthly_limit") is not None:
+            lines.append(_kv("Monthly limit",
+                             fmt_money(eu.get("monthly_limit"))
+                             if isinstance(eu.get("monthly_limit"), dict)
+                             else str(eu.get("monthly_limit")), cols))
+        if eu.get("used_credits") is not None:
+            lines.append(_kv("Used credits", str(eu.get("used_credits")), cols))
+        if util is not None:
+            lines.append(_kv("Utilization", fmt_pct(float(util)), cols))
+    else:
+        reason = ("user disabled" if eu.get("user_disabled")
+                  else eu.get("disabled_reason") or "off")
+        lines.append(_kv("Status", reason, cols))
+        if eu.get("spend_limit_reached"):
+            lines.append(_kv("Spend limit",
+                             "reached", cols, vcol=SEV_COL["critical"]))
+    return lines
+
+
+# name → renderer. The BOOT/LIVE-backed sections take only `cols`, so they're
+# adapted here rather than rewritten.
+PANEL_SECTIONS = {
+    "limits": limits_section,
+    "additional": additional_section,
+    "credits": credits_section,
+    "extra_usage": extra_usage_section,
+    "sessions": lambda ctx: sessions_section(ctx["cols"]),
+    "recent": lambda ctx: recent_section(ctx["cols"]),
+    "account": lambda ctx: account_section(ctx["cols"]),
+    "connectors": lambda ctx: connectors_section(ctx["cols"]),
+    "cowork": lambda ctx: cowork_section(ctx["cols"]),
+}
+
+# The default order — identical to the hardcoded layout it replaced.
+DEFAULT_SECTIONS = ("limits", "additional", "credits", "extra_usage",
+                    "sessions", "recent", "account", "connectors", "cowork")
+
+# What survives the [s] "just the numbers" toggle.
+CORE_SECTIONS = ("limits", "additional", "credits", "extra_usage")
+
+
+def normalize_sections(raw):
+    """Coerce a config/env/CLI section list into a validated tuple of known
+    section names, order preserved and duplicates dropped. Anything unusable
+    (missing, wrong type, all-unknown names) falls back to DEFAULT_SECTIONS —
+    a typo in the config must never render an empty panel."""
+    if raw is None:
+        return tuple(DEFAULT_SECTIONS)
+    if isinstance(raw, str):
+        items = raw.replace(",", " ").split()
+    elif isinstance(raw, (list, tuple)):
+        items = raw
+    else:
+        return tuple(DEFAULT_SECTIONS)
+    out = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        name = item.strip().lower()
+        if name in PANEL_SECTIONS and name not in out:
+            out.append(name)
+    return tuple(out) if out else tuple(DEFAULT_SECTIONS)
+
+
+def render_panel(data, cols, rows, interval, history=None, sections=None):
+    now = datetime.now()
+    t = now.strftime("%-I:%M%p").lower()
+    lines = [join_lr(f"{STAR} Claude Usage", f"{REFRESH} {t}", cols)]
+
+    ctx = _panel_ctx(data, cols, history)
+    for name in (sections if sections is not None else DEFAULT_SECTIONS):
+        fn = PANEL_SECTIONS.get(name)
+        if fn is None:
+            continue
+        part = fn(ctx)
+        if not part:
+            continue
+        lines.append("")  # one blank line above every section, incl. the first
+        lines.extend(part)
 
     # Footer is always the last visible row, even if content overflows.
     body = lines[:rows - 1]
@@ -1258,7 +1338,7 @@ def render_panel(data, cols, rows, interval, history=None):
     return body
 
 # ── Top-level renderer ────────────────────────────────────────────────
-def render(data, cols, rows, interval, mdef, history=None):
+def render(data, cols, rows, interval, mdef, history=None, sections=None):
     n = len(mdef)
     if rows < 7:
         return render_horizontal(data, cols, rows, interval, mdef)
@@ -1272,7 +1352,7 @@ def render(data, cols, rows, interval, mdef, history=None):
     # the only layout roomy enough for trend sparklines; smaller ones ignore
     # `history` and degrade cleanly to bars-only.
     if rows >= 20 and cols >= 46:
-        return render_panel(data, cols, rows, interval, history)
+        return render_panel(data, cols, rows, interval, history, sections)
 
     if rows >= 12 and cols >= 22:
         lines = [header_full(cols), ""]
@@ -1313,6 +1393,66 @@ def draw(lines, last):
         sys.stdout.write(buf)
         sys.stdout.flush()
     return buf
+
+
+# ── Keyboard navigation ───────────────────────────────────────────────
+# All key decisions live in one pure function so the interactive loop stays a
+# thin shell (read a byte → handle_key → redraw). The state is a plain dict:
+#
+#   running   False once the user quit
+#   force     True for exactly one tick after a manual refresh key
+#   theme     the active theme name (main() calls apply_theme when it changes)
+#   sections  the configured section order (never mutated by keys)
+#   hidden    frozenset of section names toggled off with the digit keys
+#   compact   True while [s] is hiding everything but the core numbers
+#
+# The footer's key hint is deliberately left at "[r]efresh [q]uit" (the new keys
+# are documented in the README and --help instead) so the panel stays byte-
+# identical to the golden render — see LEDGER D-28.
+def initial_key_state(cfg):
+    """Build the live-loop state from a resolved runtime config."""
+    return {"running": True, "force": True, "theme": cfg.get("theme", DEFAULT_THEME),
+            "sections": tuple(cfg.get("sections") or DEFAULT_SECTIONS),
+            "hidden": frozenset(), "compact": False}
+
+
+def visible_sections(state):
+    """The section names to render, given the config order + live toggles."""
+    names = [n for n in (state.get("sections") or DEFAULT_SECTIONS)
+             if n not in (state.get("hidden") or frozenset())]
+    if state.get("compact"):
+        names = [n for n in names if n in CORE_SECTIONS]
+    return tuple(names)
+
+
+def handle_key(state, key):
+    """Pure key handler: (state, keypress) -> new state. Never mutates the
+    input, never touches the terminal — so every binding is unit-testable
+    offline. Unknown keys return an equivalent state with `force` cleared."""
+    st = dict(state)
+    st["force"] = False
+    if key in ("q", "Q", "\x03", "\x04"):
+        st["running"] = False
+    elif key in ("r", "R", " "):
+        st["force"] = True
+    elif key in ("t", "T"):
+        cycle = sorted(THEMES)
+        try:
+            nxt = cycle[(cycle.index(st.get("theme")) + 1) % len(cycle)]
+        except ValueError:  # unknown/absent current theme → start at the top
+            nxt = cycle[0]
+        st["theme"] = nxt
+    elif key in ("s", "S"):
+        st["compact"] = not st.get("compact")
+    elif key in "123456789" and len(key) == 1:
+        names = st.get("sections") or DEFAULT_SECTIONS
+        idx = int(key) - 1
+        if idx < len(names):
+            name = names[idx]
+            hidden = set(st.get("hidden") or ())
+            hidden.symmetric_difference_update({name})
+            st["hidden"] = frozenset(hidden)
+    return st
 
 
 # ── Snapshot persistence (history) ────────────────────────────────────
@@ -1696,6 +1836,9 @@ def main():
                     help="override where once-per-crossing state is stored")
     ap.add_argument("--theme", choices=sorted(THEMES), default=None,
                     help=f"color theme [{DEFAULT_THEME}]")
+    ap.add_argument("--sections", default=None,
+                    help="comma-separated big-panel sections, in order "
+                         f"(choices: {', '.join(sorted(PANEL_SECTIONS))})")
     args = ap.parse_args()
 
     # Precedence: CLI flag > env var > config file > built-in default.
@@ -1705,7 +1848,8 @@ def main():
            "history_path": args.history_path, "alerts": args.alerts,
            "alert_threshold": args.alert_threshold,
            "alert_notifier": args.alert_notifier,
-           "alert_state_path": args.alert_state_path, "theme": args.theme}
+           "alert_state_path": args.alert_state_path, "theme": args.theme,
+           "sections": args.sections}
     env = {"interval": os.environ.get("CLAUDE_USAGE_INTERVAL"),
            "extras_interval": os.environ.get("CLAUDE_USAGE_EXTRAS_INTERVAL"),
            "bootstrap_interval": os.environ.get("CLAUDE_USAGE_BOOTSTRAP_INTERVAL"),
@@ -1717,7 +1861,8 @@ def main():
            "alert_threshold": os.environ.get("CLAUDE_USAGE_ALERT_THRESHOLD"),
            "alert_notifier": os.environ.get("CLAUDE_USAGE_ALERT_NOTIFIER"),
            "alert_state_path": os.environ.get("CLAUDE_USAGE_ALERT_STATE_PATH"),
-           "theme": os.environ.get("CLAUDE_USAGE_THEME")}
+           "theme": os.environ.get("CLAUDE_USAGE_THEME"),
+           "sections": os.environ.get("CLAUDE_USAGE_SECTIONS")}
     cfg = resolve_runtime_config(cli, env, load_config())
     interval = cfg["interval"]
     extras_interval = cfg["extras_interval"]
@@ -1740,7 +1885,11 @@ def main():
     org = resolve_org(cfg["org"], BOOT, cookie)
     cache, err = None, None
     last_fetch = last_extra = last_boot = 0.0
-    last_buf, force = "", True
+    last_buf = ""
+    # Live UI state (theme, section visibility, refresh/quit) — all key
+    # decisions go through the pure handle_key(); this loop only does I/O.
+    state = initial_key_state(cfg)
+    force = state["force"]
     # Recent history for trend sparklines: seed from disk (so prior runs / cron
     # samples show up immediately), then extend live. Read-only view; capped so
     # a long-lived process doesn't grow it unbounded.
@@ -1852,17 +2001,19 @@ def main():
             mdef = primary_metrics(cache) if cache else []
             cols, rows = shutil.get_terminal_size((80, 24))
             lines = (error_lines(err, cols, rows) if err
-                     else render(cache, cols, rows, interval, mdef, hist_recent))
+                     else render(cache, cols, rows, interval, mdef, hist_recent,
+                                 visible_sections(state)))
             last_buf = draw(lines, last_buf)
 
             if is_tty:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.3)
                 if ready:
-                    ch = sys.stdin.read(1)
-                    if ch in ("r", "R", " "):
-                        force = True
-                    elif ch in ("q", "Q", "\x03"):
+                    state = handle_key(state, sys.stdin.read(1))
+                    if not state["running"]:
                         break
+                    force = state["force"]
+                    if state["theme"] != THEME:
+                        apply_theme(state["theme"])  # rebind the palette, redraw
             else:
                 time.sleep(0.3)
     except KeyboardInterrupt:
