@@ -14,7 +14,16 @@ No third-party test runner needed.
 """
 import os
 import sys
+import time
 from datetime import datetime, timezone
+
+# Freezing the clock isn't enough to make rendering reproducible: fmt_reset()
+# formats reset times in the LOCAL zone, so the same frozen instant renders
+# "2:00pm" here and "6:00pm" on a UTC CI runner. Pin the zone as well, before
+# anything imports the module, so byte-exact assertions hold everywhere.
+os.environ["TZ"] = "UTC"
+if hasattr(time, "tzset"):  # POSIX only; the suite targets Linux/CI
+    time.tzset()
 
 # The runtime is now an importable module (claude_usage.py). Ensure the repo
 # root is on sys.path so `import claude_usage` works whether or not the package
@@ -726,13 +735,14 @@ def test_run_once_exit_code_on_alert(mod):
 # ── Phase 7: selectable color themes ──────────────────────────────────
 
 # Hash of the full render matrix (both fixtures × every size, with history)
-# captured from the code as it stood BEFORE the theme system existed. The
-# default theme must reproduce it byte for byte, forever — this is the
-# no-visual-regression gate the phase is built around. If a deliberate change
-# to the default palette or the renderer ever makes this fail, re-capture it in
-# the same commit and say so in the message.
+# captured from the code as it stood BEFORE the theme system existed (commit
+# d7536a3), under the frozen clock AND the UTC zone pinned at the top of this
+# file. The default theme must reproduce it byte for byte, forever — this is
+# the no-visual-regression gate the phase is built around. If a deliberate
+# change to the default palette or the renderer ever makes this fail,
+# re-capture it in the same commit and say so in the message.
 GOLDEN_DEFAULT_RENDER = \
-    "d3d166282b5585fe64bde958befb2c9e43b0e4526deb66193c4ac9a7182c0162"
+    "e22bb27d3b169a4c0e586cf20944add60811d1f9652a338541947b6f8d6ae730"
 
 
 def _render_matrix_hash(mod):
