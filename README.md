@@ -47,7 +47,7 @@ Requires Python 3.9+.
 Install as a command with [pipx](https://pipx.pypa.io):
 
 ```bash
-pipx install git+https://github.com/parsa-j42/claude-usage
+pipx install git+https://github.com/parsaj-dev/claude-usage-dashboard
 # or from a local checkout:
 pipx install .
 ```
@@ -56,7 +56,7 @@ This puts a `claude-usage` command on your PATH. To also read cookies from the
 browser automatically, install the optional extra:
 
 ```bash
-pipx install "claude-usage[cookies] @ git+https://github.com/parsa-j42/claude-usage"
+pipx install "claude-usage[cookies] @ git+https://github.com/parsaj-dev/claude-usage-dashboard"
 ```
 
 `browser-cookie3` (the `cookies` extra) is optional; without it, supply the
