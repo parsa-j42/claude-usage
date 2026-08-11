@@ -396,7 +396,8 @@ def test_panel_trend_line_fits_width(mod):
                  for i in range(60)]  # more than any width would show
     mdef = mod.primary_metrics(DATA)
     for cols in (46, 60, 100):
-        lines = _strip(mod.render(DATA, cols, 40, 120, mdef, long_hist))
+        lines = _strip(mod.render(DATA, cols, 40, 120, mdef, long_hist,
+                                  None, True))
         assert max(len(l) for l in lines) <= cols, f"overflow at cols={cols}"
         assert any(l.strip().startswith("trend ") for l in lines)
 
@@ -410,13 +411,13 @@ def test_panel_shows_sparkline(mod):
     """The big layout gains a `trend` line (with block glyphs) once ≥2 samples
     exist; output is identical across calls (deterministic)."""
     mdef = mod.primary_metrics(DATA)
-    lines = mod.render(DATA, 100, 40, 120, mdef, HISTORY)
+    lines = mod.render(DATA, 100, 40, 120, mdef, HISTORY, None, True)
     trend_lines = [l for l in _strip(lines) if l.strip().startswith("trend ")]
     assert trend_lines, "no trend line in the panel"
     # The glyphs after the marker must be sparkline blocks.
     glyphs = trend_lines[0].strip()[len("trend "):]
     assert glyphs and all(g in mod._SPARK_GLYPHS for g in glyphs)
-    assert mod.render(DATA, 100, 40, 120, mdef, HISTORY) == lines  # stable
+    assert mod.render(DATA, 100, 40, 120, mdef, HISTORY, None, True) == lines
 
 
 def test_small_layouts_have_no_sparkline(mod):
@@ -436,7 +437,7 @@ def test_panel_no_history_is_graceful(mod):
     import re
     mdef = mod.primary_metrics(DATA)
     for hist in (None, [], HISTORY[:1]):  # short = single sample
-        lines = mod.render(DATA, 100, 40, 120, mdef, hist)
+        lines = mod.render(DATA, 100, 40, 120, mdef, hist, None, True)
         plain = "\n".join(re.sub(r"\033\[[0-9;]*m", "", l) for l in lines)
         assert "trend " not in plain, f"history={hist}"
 
@@ -734,15 +735,20 @@ def test_run_once_exit_code_on_alert(mod):
 
 # ── Phase 7: selectable color themes ──────────────────────────────────
 
-# Hash of the full render matrix (both fixtures × every size, with history)
-# captured from the code as it stood BEFORE the theme system existed (commit
-# d7536a3), under the frozen clock AND the UTC zone pinned at the top of this
-# file. The default theme must reproduce it byte for byte, forever — this is
-# the no-visual-regression gate the phase is built around. If a deliberate
-# change to the default palette or the renderer ever makes this fail,
-# re-capture it in the same commit and say so in the message.
+# Hash of the full render matrix (both fixtures × every size, with history and
+# trends on) under the frozen clock AND the UTC zone pinned at the top of this
+# file. The default theme must reproduce it byte for byte — this is the
+# no-visual-regression gate. If a deliberate change to the default palette or
+# the renderer ever makes this fail, re-capture it in the same commit and say
+# so in the message.
+#
+# Re-captured twice so far, both deliberate:
+#   d7536a3 → e22bb27d…  original, from before the theme system existed
+#   (pace)  → fe38adcb…  the pace tick, which adds a ┃ cell to every limit bar
+#                        with a known reset window, plus an "N× pace" gloss on
+#                        the reset line when it fits.
 GOLDEN_DEFAULT_RENDER = \
-    "e22bb27d3b169a4c0e586cf20944add60811d1f9652a338541947b6f8d6ae730"
+    "fe38adcba1f8e2cf6e975737dfdbf3bdd874c576485327c91beaecec88051d44"
 
 
 def _render_matrix_hash(mod):
@@ -751,7 +757,8 @@ def _render_matrix_hash(mod):
     for data in (DATA, LEGACY):
         for cols, rows in SIZES:
             mdef = mod.primary_metrics(data)
-            blob.append("\n".join(mod.render(data, cols, rows, 120, mdef, HISTORY)))
+            blob.append("\n".join(mod.render(data, cols, rows, 120, mdef, HISTORY,
+                                             None, True)))
     return hashlib.sha256("\x00".join(blob).encode()).hexdigest()
 
 
@@ -776,7 +783,7 @@ def test_every_theme_renders_stably(mod):
     for data_name, data in (("DATA", DATA), ("LEGACY", LEGACY)):
         for cols, rows in SIZES:
             mdef = mod.primary_metrics(data)
-            lines = mod.render(data, cols, rows, 120, mdef, HISTORY)
+            lines = mod.render(data, cols, rows, 120, mdef, HISTORY, None, True)
             baselines[(data_name, cols, rows)] = [ansi.sub("", l) for l in lines]
 
     for name in mod.THEMES:
@@ -784,9 +791,9 @@ def test_every_theme_renders_stably(mod):
         for data_name, data in (("DATA", DATA), ("LEGACY", LEGACY)):
             for cols, rows in SIZES:
                 mdef = mod.primary_metrics(data)
-                lines = mod.render(data, cols, rows, 120, mdef, HISTORY)
+                lines = mod.render(data, cols, rows, 120, mdef, HISTORY, None, True)
                 assert len(lines) == rows, f"{name} {cols}x{rows}"
-                again = mod.render(data, cols, rows, 120, mdef, HISTORY)
+                again = mod.render(data, cols, rows, 120, mdef, HISTORY, None, True)
                 assert lines == again, f"{name} {cols}x{rows} not deterministic"
                 assert [ansi.sub("", l) for l in lines] == \
                     baselines[(data_name, cols, rows)], \
@@ -1040,6 +1047,115 @@ def test_visible_sections_drives_the_panel(mod):
     lines = _panel(mod, RICH, mod.visible_sections(st))
     assert _headers(mod, lines) == ["limits", "additional"]
     assert len(lines) == 40
+
+
+# ── Pace tick (replaces the trend sparkline as the default) ───────────
+
+def _at(mod, iso):
+    """Parse an ISO stamp with the module's frozen clock semantics."""
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
+def test_window_seconds(mod):
+    assert mod.window_seconds("session") == 5 * 3600
+    assert mod.window_seconds("five_hour") == 5 * 3600
+    assert mod.window_seconds("weekly_all") == 7 * 86400
+    assert mod.window_seconds("seven_day") == 7 * 86400
+    # Unknown weekly_* buckets (the API keeps adding scoped ones) are weekly.
+    assert mod.window_seconds("weekly_opus_4_5") == 7 * 86400
+    assert mod.window_seconds("something_else") is None
+    assert mod.window_seconds(None) is None
+
+
+def test_pace_pct(mod):
+    now = _at(mod, "2026-08-07T14:30:15Z")
+    # 5h window resetting at 18:00 ⇒ 3h29m45s remain ⇒ 1h30m15s elapsed.
+    p = mod.pace_pct("2026-08-07T18:00:00Z", "session", now)
+    assert 30.0 < p < 30.1, p
+    # Exactly one full window left ⇒ just started.
+    assert mod.pace_pct("2026-08-07T19:30:15Z", "session", now) == 0.0
+    # Unknowable cases all yield None rather than a bogus tick.
+    assert mod.pace_pct(None, "session", now) is None
+    assert mod.pace_pct("2026-08-07T18:00:00Z", "mystery", now) is None
+    assert mod.pace_pct("not-a-date", "session", now) is None
+    assert mod.pace_pct("2026-08-07T13:00:00Z", "session", now) is None  # past
+    # A reset further out than a whole window means stale/mis-kinded data.
+    assert mod.pace_pct("2026-08-09T00:00:00Z", "session", now) is None
+
+
+def test_pace_note(mod):
+    assert mod.pace_note(70.0, 35.0) == "2.0× pace"   # burning double
+    assert mod.pace_note(20.0, 40.0) == "0.5× pace"   # coasting
+    assert mod.pace_note(40.0, 40.0) == "on pace"
+    assert mod.pace_note(43.0, 40.0) == "on pace"     # inside the dead band
+    assert mod.pace_note(50.0, None) is None
+    # Just after a reset the ratio is meaningless, so it's suppressed.
+    assert mod.pace_note(2.0, 1.0) is None
+
+
+def test_progress_bar_draws_the_tick(mod):
+    plain = lambda s: _strip([s])[0]
+    bare = plain(mod.progress_bar(50.0, 40))
+    assert mod.PACE_GLYPH not in bare          # no mark ⇒ unchanged bar
+    assert len(bare) == 40
+    for mark in (0.0, 25.0, 50.0, 99.9, 100.0):
+        marked = plain(mod.progress_bar(50.0, 40, mark))
+        assert marked.count(mod.PACE_GLYPH) == 1, mark
+        assert len(marked) == 40, mark        # the tick replaces a cell
+    # The tick lands where the percentage says it should.
+    assert plain(mod.progress_bar(50.0, 40, 25.0)).index(mod.PACE_GLYPH) == 10
+    assert plain(mod.progress_bar(50.0, 40, 75.0)).index(mod.PACE_GLYPH) == 30
+    # Out-of-range marks are clamped into the bar, never dropped or overflowed.
+    for mark in (-10.0, 250.0):
+        marked = plain(mod.progress_bar(50.0, 40, mark))
+        assert marked.count(mod.PACE_GLYPH) == 1 and len(marked) == 40
+
+
+def test_panel_shows_pace_by_default(mod):
+    """No history, no config: the tick and its gloss are simply there."""
+    lines = _panel(mod, DATA, history=[])
+    plain = "\n".join(_strip(lines))
+    assert mod.PACE_GLYPH in plain
+    assert "pace" in plain
+    assert "trend " not in plain, "sparkline should be off by default"
+
+
+def test_pace_gloss_dropped_when_it_would_overflow(mod):
+    """The gloss is the lowest-priority thing on the reset row: on a narrow
+    panel it's dropped rather than wrapped (which would break the layout)."""
+    mdef = mod.primary_metrics(DATA)
+    for cols in (46, 52, 60, 80, 100):
+        lines = _strip(mod.render(DATA, cols, 40, 120, mdef))
+        assert max(len(l) for l in lines) <= cols, f"overflow at cols={cols}"
+
+
+def test_pace_absent_when_unknowable(mod):
+    """A limit with no reset time gets no tick — and nothing crashes."""
+    data = {"limits": [{"kind": "session", "percent": 42.5, "is_active": True}],
+            "spend": {}}
+    plain = "\n".join(_strip(_panel(mod, data, history=[])))
+    assert mod.PACE_GLYPH not in plain
+    assert "pace" not in plain
+
+
+def test_trends_setting_precedence(mod):
+    rc = mod.resolve_runtime_config
+    assert rc({}, {}, {})["trends"] is False          # off by default now
+    assert rc({}, {}, {"trends": True})["trends"] is True
+    assert rc({}, {"trends": "1"}, {"trends": False})["trends"] is True
+    assert rc({"trends": True}, {"trends": "0"}, {})["trends"] is True
+    assert rc({}, {}, {"trends": "garbage"})["trends"] is False
+
+
+def test_primary_metrics_carries_kind(mod):
+    """The small layouts need `kind` to place their tick, so it rides along in
+    the metric tuple."""
+    for m in mod.primary_metrics(DATA):
+        assert len(m) == 5, m
+    kinds = {m[4] for m in mod.primary_metrics(DATA)}
+    assert kinds == {"session", "weekly_all"}, kinds
+    assert {m[4] for m in mod.primary_metrics(LEGACY)} == {"five_hour",
+                                                           "seven_day"}
 
 
 def main():

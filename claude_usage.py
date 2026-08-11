@@ -192,7 +192,14 @@ def sheen(base, i, n):
     f = 0.62 + 0.38 * t
     return rgb(*[min(255, int(c * f)) for c in base])
 
-def progress_bar(pct, width):
+PACE_GLYPH = "┃"
+
+def progress_bar(pct, width, mark=None):
+    """The usage bar. `mark` (0–100) draws a one-cell pace tick at that position
+    — see pace_pct(): both numbers are percentages on the same scale, so "how
+    much quota is gone" and "how much of the window is gone" can share one bar.
+    The tick is dark against the filled run (a notch) and bright against the
+    empty track, so it reads wherever it lands."""
     if width < 1:
         return ""
     pct = max(0.0, min(pct, 100.0))
@@ -209,8 +216,14 @@ def progress_bar(pct, width):
     if eighth:
         parts.append(sheen(base, full, max(fill_cells, 1)) + EIGHTHS[eighth])
     empty = width - full - (1 if eighth else 0)
-    if empty > 0:
-        parts.append(TRACK + "░" * empty)
+    if mark is None:
+        # Fast path: the empty track is one run, not `empty` separate cells.
+        if empty > 0:
+            parts.append(TRACK + "░" * empty)
+        return "".join(parts) + R
+    parts += [TRACK + "░"] * max(0, empty)  # one cell each, so one can be swapped
+    idx = max(0, min(width - 1, int(mark / 100.0 * width)))
+    parts[idx] = (TRACK if idx < fill_cells else f"{BOLD}{CREAM}") + PACE_GLYPH
     return "".join(parts) + R
 
 def fmt_pct(pct, decimals=False):
@@ -259,6 +272,68 @@ def fmt_reset(iso):
     if hrs >= 1:
         return f"{hrs}h {mins % 60}m · {tstr}"
     return f"{mins}m · {tstr}"
+
+# ── Pace ──────────────────────────────────────────────────────────────
+# A limit has two numbers that are already percentages on the same 0–100 scale:
+# how much quota is gone, and how much of the reset window is gone. So they can
+# share one bar — the fill is your usage, a one-cell tick is the clock. Tick
+# left of the fill edge ⇒ burning faster than the window replenishes; right of
+# it ⇒ slack. This needs NO history: the window length is implied by the limit
+# kind and the remaining time comes from `resets_at`, both of which every single
+# reading already carries. That's why it works on the first frame, in every
+# layout, with no history file (unlike the trend sparkline it replaces).
+_HOUR, _DAY = 3600, 86400
+LIMIT_WINDOWS = {           # kind → window length in seconds
+    "session": 5 * _HOUR, "five_hour": 5 * _HOUR,
+    "weekly_all": 7 * _DAY, "weekly_scoped": 7 * _DAY, "seven_day": 7 * _DAY,
+}
+
+
+def window_seconds(kind):
+    """Reset-window length for a limit kind, or None when it isn't known. Any
+    unrecognized `weekly_*` kind is treated as 7 days — the API keeps adding
+    scoped weekly buckets and they all share the weekly boundary."""
+    if not kind:
+        return None
+    if kind in LIMIT_WINDOWS:
+        return LIMIT_WINDOWS[kind]
+    return 7 * _DAY if str(kind).startswith("weekly") else None
+
+
+def pace_pct(iso, kind, now=None):
+    """How far through the reset window we are, as a percent (0–100), or None
+    when it can't be known (no reset timestamp, unknown window, unparseable
+    date, or a reset further out than one whole window — which means the data
+    is stale or the kind was guessed wrong, and a bogus tick is worse than no
+    tick)."""
+    window = window_seconds(kind)
+    if not window or not iso:
+        return None
+    try:
+        d = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    now = now or datetime.now(timezone.utc)
+    remaining = (d - now).total_seconds()
+    if remaining <= 0 or remaining > window:
+        return None
+    return (window - remaining) / window * 100.0
+
+
+def pace_note(pct, pace):
+    """Plain-language gloss for the tick: how your burn compares to burning the
+    window evenly. None when the comparison would be noise — right after a reset
+    a tiny elapsed fraction makes the ratio explode (2% used of 1% elapsed is
+    not "2× pace", it's one prompt)."""
+    if pace is None or pace < 5.0:
+        return None
+    ratio = pct / pace
+    if ratio >= 1.15:
+        return f"{ratio:.1f}× pace"
+    if ratio <= 0.85:
+        return f"{ratio:.1f}× pace"
+    return "on pace"
+
 
 # ── Cookie acquisition ────────────────────────────────────────────────
 # claude.ai rotates sessionKey, cf_clearance and __cf_bm out from under a
@@ -443,6 +518,11 @@ def resolve_runtime_config(cli, env, cfg):
                             cfg.get("theme"), DEFAULT_THEME)
     if theme not in THEMES:
         theme = DEFAULT_THEME  # a stale name shouldn't stop the dash starting
+    # Trend sparklines: off by default since the pace tick answers the same
+    # question inline (and without needing any history at all).
+    trends = resolve_setting(_coerce_bool(cli.get("trends")),
+                             _coerce_bool(env.get("trends")),
+                             _coerce_bool(cfg.get("trends")), False)
     # Panel sections: which big-panel blocks show, and in what order. A string
     # (CLI/env, comma- or space-separated) or a TOML array both work; unknown
     # names are dropped and an unusable list falls back to the default order.
@@ -471,6 +551,7 @@ def resolve_runtime_config(cli, env, cfg):
         "alert_state_path": os.path.expanduser(alert_state_path),
         "theme": theme,
         "sections": sections,
+        "trends": trends,
     }
 
 # ── Endpoints ─────────────────────────────────────────────────────────
@@ -733,14 +814,16 @@ def extra_metrics(data, seen_labels=()):
 def primary_metrics(data):
     """The key usage limits for the small views: session + weekly, plus any
     active scoped limit that's actually being consumed. Returned as
-    (full, compact, pct, iso) tuples so the compact renderers stay simple."""
+    (full, compact, pct, iso, kind) tuples so the compact renderers stay
+    simple. `kind` is what pace_pct() needs to know the reset-window length."""
     keep = []
     for lim in all_limits(data):
         if lim["kind"] in ("session", "weekly_all", "five_hour", "seven_day"):
             keep.append(lim)
         elif lim["active"] or lim["pct"] > 0:
             keep.append(lim)  # a scoped limit that's live/consumed
-    return [(l["full"], l["compact"], l["pct"], l["iso"]) for l in keep]
+    return [(l["full"], l["compact"], l["pct"], l["iso"], l.get("kind"))
+            for l in keep]
 
 # ── Shared bits ───────────────────────────────────────────────────────
 def brand_left(text):
@@ -792,14 +875,14 @@ def compact_line(label, pct, cols):
         return f"{lab} {pcell}"
     return f"{lab} {progress_bar(pct, bar_w)} {pcell}"
 
-def bar_line_full(label, pct, cols):
+def bar_line_full(label, pct, cols, pace=None):
     lw, pw = 7, 6
     pcell = f"{rgb(*heat(pct))}{BOLD}{fmt_pct(pct, decimals=True):>{pw}}{R}"
     lab = f"{CREAM}{label:<{lw}}{R}"
     bar_w = cols - lw - 1 - 1 - pw
     if bar_w < 3:
         return f"{lab} {pcell}"
-    return f"{lab} {progress_bar(pct, bar_w)} {pcell}"
+    return f"{lab} {progress_bar(pct, bar_w, pace)} {pcell}"
 
 def reset_line(iso, cols):
     s = f"        {RESET_GLYPH} {fmt_reset(iso)}"
@@ -839,7 +922,7 @@ def render_horizontal(data, cols, rows, interval, mdef):
     # share one signature so render() can dispatch them interchangeably; each
     # takes (data, cols, rows, interval, mdef) even where it needs only a subset.
     now = datetime.now()
-    metrics = [(fl, cl, pct) for fl, cl, pct, _iso in mdef]
+    metrics = [(fl, cl, pct) for fl, cl, pct, _iso, _k in mdef]
     n = len(metrics)
     gutter, cell_min = 2, 10
     has_header = rows >= 2
@@ -885,7 +968,7 @@ def render_vbars(data, cols, rows, interval, mdef):
     pre = " " * max(0, (cols - fw * n) // 2)
     H = max(1, rows - 4)               # header + labels + pcts + footer = 4
 
-    metrics = [(cl, pct) for _, cl, pct, _iso in mdef]
+    metrics = [(cl, pct) for _, cl, pct, _iso, _k in mdef]
     geom = []
     for _, p in metrics:
         filled = max(0.0, min(p, 100.0)) / 100.0 * H
@@ -923,7 +1006,7 @@ def render_stacked(data, cols, rows, interval, mdef):
     now = datetime.now()
     pw = 4
     core = [header_full(cols)]
-    for _, cl, pct, _iso in mdef:
+    for _, cl, pct, _iso, _k in mdef:
         core.append(f"{CREAM}{cl}{R}")
         bar_w = cols - 1 - pw
         pcell = f"{rgb(*heat(pct))}{BOLD}{fmt_pct(pct):>{pw}}{R}"
@@ -1161,11 +1244,12 @@ def trend_series(history, label, n=None):
 # separating non-empty ones with a single blank line — so the section list is
 # pure config (and the default order reproduces the pre-Phase-8 layout byte for
 # byte). ctx carries the per-frame values every section might need.
-def _panel_ctx(data, cols, history=None):
+def _panel_ctx(data, cols, history=None, trends=False):
     limits = all_limits(data)
     return {
         "data": data or {},
         "cols": cols,
+        "trends": trends,
         "limits": limits,
         "extras": extra_metrics(data, seen_labels=[l["full"] for l in limits]),
         # Build the label → pct-series map once per frame (not once per metric).
@@ -1176,25 +1260,37 @@ def _panel_ctx(data, cols, history=None):
     }
 
 
-def _bar_rows(ctx, label, pct, iso, sev="normal"):
-    """The bar + reset + trend rows for one metric (shared by limits/extras)."""
+def _bar_rows(ctx, label, pct, iso, sev="normal", kind=None):
+    """The bar + reset (+ optional trend) rows for one metric, shared by the
+    limits and additional sections."""
     cols = ctx["cols"]
     out = []
     scol = SEV_COL.get(sev, GREY)
     lab = label[:9]
     pcell = f"{rgb(*heat(pct))}{BOLD}{fmt_pct(pct, decimals=True):>6}{R}"
     bar_w = max(6, cols - 9 - 1 - 1 - 6)
-    out.append(f"{CREAM}{lab:<9}{R} {progress_bar(pct, bar_w)} {pcell}")
+    pace = pace_pct(iso, kind)
+    out.append(f"{CREAM}{lab:<9}{R} {progress_bar(pct, bar_w, pace)} {pcell}")
     if iso:
         r = f"{RESET_GLYPH} {fmt_reset(iso)}"
-        badge = "" if sev == "normal" else f"  {scol}({sev}){R}"
-        out.append(f"          {DIM}{GREY}{r}{R}{badge}")
-    # Trend sparkline — only once at least two samples exist for this metric,
-    # so it fills in as history accrues and never shows a lone dot.
-    series = ctx["trend_map"].get(label, ())
-    if len(series) >= 2:
-        spark = sparkline(series, width=ctx["spark_w"])
-        out.append(f"          {DIM}{GREY}trend {CREAM}{spark}{R}")
+        badge = "" if sev == "normal" else f"  ({sev})"
+        # The pace gloss carries the tick glyph so the bar explains itself. It's
+        # the lowest-priority thing on the row, so it's dropped (not wrapped)
+        # when the reset text and severity badge have already eaten the width.
+        note = pace_note(pct, pace)
+        gloss = f"  {PACE_GLYPH} {note}" if note else ""
+        if 10 + len(r) + len(badge) + len(gloss) > cols:
+            gloss = ""
+        out.append(f"          {DIM}{GREY}{r}{R}"
+                   + (f"  {scol}({sev}){R}" if badge else "")
+                   + (f"  {DIM}{GREY}{PACE_GLYPH} {note}{R}" if gloss else ""))
+    # Trend sparkline — opt-in (`trends = true`), and only once at least two
+    # samples exist for this metric, so it never shows a lone dot.
+    if ctx["trends"]:
+        series = ctx["trend_map"].get(label, ())
+        if len(series) >= 2:
+            spark = sparkline(series, width=ctx["spark_w"])
+            out.append(f"          {DIM}{GREY}trend {CREAM}{spark}{R}")
     return out
 
 
@@ -1205,7 +1301,7 @@ def limits_section(ctx):
             lines.append(f"{CREAM}{lim['full'][:9]:<9}{R} {DIM}{GREY}idle{R}")
             continue
         lines.extend(_bar_rows(ctx, lim["full"], lim["pct"], lim["iso"],
-                               lim["severity"]))
+                               lim["severity"], lim.get("kind")))
     return lines
 
 
@@ -1314,12 +1410,13 @@ def normalize_sections(raw):
     return tuple(out) if out else tuple(DEFAULT_SECTIONS)
 
 
-def render_panel(data, cols, rows, interval, history=None, sections=None):
+def render_panel(data, cols, rows, interval, history=None, sections=None,
+                 trends=False):
     now = datetime.now()
     t = now.strftime("%-I:%M%p").lower()
     lines = [join_lr(f"{STAR} Claude Usage", f"{REFRESH} {t}", cols)]
 
-    ctx = _panel_ctx(data, cols, history)
+    ctx = _panel_ctx(data, cols, history, trends)
     for name in (sections if sections is not None else DEFAULT_SECTIONS):
         fn = PANEL_SECTIONS.get(name)
         if fn is None:
@@ -1338,7 +1435,8 @@ def render_panel(data, cols, rows, interval, history=None, sections=None):
     return body
 
 # ── Top-level renderer ────────────────────────────────────────────────
-def render(data, cols, rows, interval, mdef, history=None, sections=None):
+def render(data, cols, rows, interval, mdef, history=None, sections=None,
+           trends=False):
     n = len(mdef)
     if rows < 7:
         return render_horizontal(data, cols, rows, interval, mdef)
@@ -1352,12 +1450,13 @@ def render(data, cols, rows, interval, mdef, history=None, sections=None):
     # the only layout roomy enough for trend sparklines; smaller ones ignore
     # `history` and degrade cleanly to bars-only.
     if rows >= 20 and cols >= 46:
-        return render_panel(data, cols, rows, interval, history, sections)
+        return render_panel(data, cols, rows, interval, history, sections,
+                            trends)
 
     if rows >= 12 and cols >= 22:
         lines = [header_full(cols), ""]
-        for flab, _clab, pct, iso in mdef:
-            lines.append(bar_line_full(flab, pct, cols))
+        for flab, _clab, pct, iso, kind in mdef:
+            lines.append(bar_line_full(flab, pct, cols, pace_pct(iso, kind)))
             lines.append(reset_line(iso, cols))
         while len(lines) < rows - 1:
             lines.append("")
@@ -1365,7 +1464,7 @@ def render(data, cols, rows, interval, mdef, history=None, sections=None):
         return lines[:rows]
 
     # Compact vertical: one line per metric, with spacers + footer.
-    core = [compact_line(clab, pct, cols) for _flab, clab, pct, _iso in mdef]
+    core = [compact_line(clab, pct, cols) for _flab, clab, pct, _iso, _k in mdef]
     has_footer = rows >= len(core) + 4
     remaining = rows - len(core) - 1 - has_footer  # header always present here
 
@@ -1486,7 +1585,7 @@ def snapshot(data):
     limits (label/pct/reset) + spend. Pure aside from the clock, which the tests
     freeze via the module-level `datetime`, so output is deterministic."""
     limits = [{"label": full, "pct": pct, "resets_at": iso}
-              for (full, _compact, pct, iso) in primary_metrics(data)]
+              for (full, _compact, pct, iso, _kind) in primary_metrics(data)]
     sp = data.get("spend") or {}
     used, limit = sp.get("used") or {}, sp.get("limit") or {}
     currency = (used.get("currency") if isinstance(used, dict) else None) or \
@@ -1836,6 +1935,10 @@ def main():
                     help="override where once-per-crossing state is stored")
     ap.add_argument("--theme", choices=sorted(THEMES), default=None,
                     help=f"color theme [{DEFAULT_THEME}]")
+    ap.add_argument("--trends", dest="trends", action="store_const",
+                    const=True, default=None,
+                    help="also draw the history trend sparkline under each "
+                         "limit (needs a few stored samples) [off]")
     ap.add_argument("--sections", default=None,
                     help="comma-separated big-panel sections, in order "
                          f"(choices: {', '.join(sorted(PANEL_SECTIONS))})")
@@ -1849,7 +1952,7 @@ def main():
            "alert_threshold": args.alert_threshold,
            "alert_notifier": args.alert_notifier,
            "alert_state_path": args.alert_state_path, "theme": args.theme,
-           "sections": args.sections}
+           "sections": args.sections, "trends": args.trends}
     env = {"interval": os.environ.get("CLAUDE_USAGE_INTERVAL"),
            "extras_interval": os.environ.get("CLAUDE_USAGE_EXTRAS_INTERVAL"),
            "bootstrap_interval": os.environ.get("CLAUDE_USAGE_BOOTSTRAP_INTERVAL"),
@@ -1862,7 +1965,8 @@ def main():
            "alert_notifier": os.environ.get("CLAUDE_USAGE_ALERT_NOTIFIER"),
            "alert_state_path": os.environ.get("CLAUDE_USAGE_ALERT_STATE_PATH"),
            "theme": os.environ.get("CLAUDE_USAGE_THEME"),
-           "sections": os.environ.get("CLAUDE_USAGE_SECTIONS")}
+           "sections": os.environ.get("CLAUDE_USAGE_SECTIONS"),
+           "trends": os.environ.get("CLAUDE_USAGE_TRENDS")}
     cfg = resolve_runtime_config(cli, env, load_config())
     interval = cfg["interval"]
     extras_interval = cfg["extras_interval"]
@@ -2002,7 +2106,7 @@ def main():
             cols, rows = shutil.get_terminal_size((80, 24))
             lines = (error_lines(err, cols, rows) if err
                      else render(cache, cols, rows, interval, mdef, hist_recent,
-                                 visible_sections(state)))
+                                 visible_sections(state), cfg["trends"]))
             last_buf = draw(lines, last_buf)
 
             if is_tty:
