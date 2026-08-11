@@ -34,6 +34,9 @@ with your existing browser session cookie — no API key, nothing to configure.
 - **Everything the API exposes.** Session/weekly limits, model-scoped limits,
   credits and spend, extra usage, plus account, connectors/MCP, cowork status,
   live code sessions, and recent chats (large windows only).
+- **Pace at a glance.** Every limit bar carries a tick showing how much of the
+  reset window has elapsed, so "am I burning too fast?" is a length comparison,
+  not arithmetic. Needs no history — it's there on the first frame.
 - **Warm "heat" gauge.** Bars shift from soft tan through Claude orange to rust
   red as a limit fills, so severity reads at a glance — or pick another of the
   four themes (`cool`, `mono`, `contrast`) with `--theme`.
@@ -109,6 +112,7 @@ put a lasting choice in the config file (`theme`, `sections`).
 | `--alert-state-path`   | —       | Override where once-per-crossing state is stored.   |
 | `--theme`              | `claude`| Color theme: `claude`, `cool`, `mono`, `contrast`.  |
 | `--sections`           | all     | Panel sections to show, in order (comma-separated). |
+| `--trends`             | off     | Also draw the history trend sparklines.             |
 
 ## History & headless mode
 
@@ -135,10 +139,35 @@ Persistence is on by default; disable it with `--no-persist` (or `persist =
 false` in config). This history file is the foundation for the trends and
 alerting features that follow.
 
-### Trend sparklines
+### Pace tick
 
-In the full panel layout (large windows), each limit gets a small block-glyph
-`trend` sparkline under its bar — the last several readings of that limit's
+Every limit bar carries a one-cell tick (`┃`) showing **how much of the reset
+window has elapsed**. Usage and elapsed time are both percentages on the same
+0–100 scale, so they share one bar:
+
+```
+5-hour    ████████████████┃██████▍░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  42.5%
+          ↺ 3h 29m · 6:00pm  ┃ 1.4× pace
+```
+
+Tick **left** of the fill edge → you're burning faster than the window
+replenishes. Tick **right** of it → you have slack. Dead level → `on pace`.
+
+It needs no history file and no stored samples: the window length is implied by
+the limit kind and the remaining time comes from `resets_at`, both of which are
+in every reading. So it's there on the first frame, in every layout. Limits
+with no reset time (or an unrecognized window) simply get no tick. The `N× pace`
+gloss is dropped on narrow panels, and suppressed right after a reset where the
+ratio would be noise.
+
+### Trend sparklines (opt-in)
+
+**Off by default** — the pace tick above answers the same question more
+directly, and without waiting for samples to accumulate. Turn them on with
+`--trends`, `CLAUDE_USAGE_TRENDS=1`, or `trends = true` in the config.
+
+In the full panel layout (large windows), each limit then gets a small
+block-glyph `trend` sparkline under its bar — the last several readings of that limit's
 usage percentage, on a fixed 0–100 scale:
 
 ```
@@ -151,6 +180,10 @@ Trends are seeded from the history file at startup (so prior runs and cron
 `--once` samples show up right away) and fill in further as the dashboard runs.
 They appear only in the full panel; smaller layouts show bars alone. The trend
 buffer works even with `--no-persist` (it just isn't written to disk).
+
+Note the honest limitation that motivated the pace tick: samples are only
+recorded when the numbers *change*, so the horizontal axis isn't proportional to
+time — one glyph might be two minutes and the next six hours.
 
 ## Themes
 
@@ -261,6 +294,8 @@ bootstrap_interval = 0
 cookie_source = "firefox"
 org = "your-org-uuid"
 theme = "claude"         # claude | cool | mono | contrast
+
+trends = false           # opt in to the history trend sparklines
 
 # Big-panel sections: which blocks show, and in what order. Omit the key for
 # all of them in the default order. Unknown names are ignored.
