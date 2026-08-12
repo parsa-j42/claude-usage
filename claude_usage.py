@@ -523,6 +523,12 @@ def resolve_runtime_config(cli, env, cfg):
     trends = resolve_setting(_coerce_bool(cli.get("trends")),
                              _coerce_bool(env.get("trends")),
                              _coerce_bool(cfg.get("trends")), False)
+    # Local context-window readings (see context_section): how many sessions to
+    # show, the assumed window size, and how stale a transcript may be.
+    context_window = i("context_window", DEFAULT_CONTEXT_WINDOW) or \
+        DEFAULT_CONTEXT_WINDOW
+    context_sessions = max(0, i("context_sessions", 3))
+    context_max_age = max(0, i("context_max_age", 24 * 3600))
     # Panel sections: which big-panel blocks show, and in what order. A string
     # (CLI/env, comma- or space-separated) or a TOML array both work; unknown
     # names are dropped and an unusable list falls back to the default order.
@@ -552,6 +558,9 @@ def resolve_runtime_config(cli, env, cfg):
         "theme": theme,
         "sections": sections,
         "trends": trends,
+        "context_window": context_window,
+        "context_sessions": context_sessions,
+        "context_max_age": context_max_age,
     }
 
 # ── Endpoints ─────────────────────────────────────────────────────────
@@ -1125,6 +1134,187 @@ def cowork_section(cols):
         out.append(_kv_onoff("SMS", s["cowork_sms_enabled"], cols))
     return out
 
+# ── Local Claude Code sessions: context-window usage ──────────────────
+# Claude Code writes one JSONL transcript per session under
+# ~/.claude/projects/<slugified-cwd>/<session-uuid>.jsonl. Every assistant
+# record carries a `message.usage` block, and the LAST one describes the
+# request that was just sent — so
+#
+#     input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+#
+# is exactly how much of the context window that session is currently holding.
+# (Cached tokens still occupy the window; counting only `input_tokens` would
+# report ~0 for a session 80% full.) `output_tokens` is excluded: it's the
+# reply, not the prompt that was sent.
+#
+# This is a LOCAL, offline source — no cookie, no endpoint, no scraping — which
+# is why it can be tested exactly. Transcripts run to megabytes, so we tail-read
+# the last chunk instead of parsing the whole file.
+DEFAULT_CONTEXT_WINDOW = 200_000
+CONTEXT_TAIL_BYTES = 256 * 1024
+
+
+def claude_projects_dir():
+    """Where Claude Code keeps its transcripts. Honors CLAUDE_CONFIG_DIR."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "projects")
+
+
+def context_tokens(usage):
+    """Tokens occupying the context window, from a `message.usage` block. The
+    three prompt-side counters, defensively coerced — a transcript written by a
+    newer/older CLI may omit any of them."""
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    found = False
+    for key in ("input_tokens", "cache_creation_input_tokens",
+                "cache_read_input_tokens"):
+        v = usage.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            total += int(v); found = True
+    return total if found else None
+
+
+def _tail_lines(path, nbytes=CONTEXT_TAIL_BYTES):
+    """The last `nbytes` of a file as complete lines, oldest first. The first
+    (probably truncated) line is dropped unless we read the whole file."""
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        start = max(0, size - nbytes)
+        fh.seek(start)
+        chunk = fh.read()
+    lines = chunk.decode("utf-8", "replace").splitlines()
+    return lines if start == 0 else lines[1:]
+
+
+def read_session_context(path, window=DEFAULT_CONTEXT_WINDOW):
+    """Scan one transcript's tail for the most recent usage block. Returns
+    {id, label, tokens, pct, window, branch, mtime} or None when the file holds
+    no usage record (a brand-new or non-assistant session). Never raises: a
+    corrupt or unreadable transcript is skipped, not fatal."""
+    try:
+        lines = _tail_lines(path)
+    except OSError:
+        return None
+    tokens = None
+    label = branch = sid = None
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue  # a partial line at a chunk edge, or a truncated write
+        if not isinstance(rec, dict):
+            continue
+        if tokens is None:
+            tokens = context_tokens((rec.get("message") or {}).get("usage"))
+        # Identity fields ride on most records; take the newest one that has
+        # them. The project directory is preferred over `customTitle` because
+        # the title is written once at the top of the file and so is only
+        # visible when the whole transcript fits in the tail — labels must not
+        # depend on how long a session happens to be.
+        label = label or (os.path.basename(rec["cwd"].rstrip("/"))
+                          if rec.get("cwd") else None) or rec.get("customTitle")
+        branch = branch or rec.get("gitBranch")
+        sid = sid or rec.get("sessionId")
+    if tokens is None:
+        return None
+    sid = sid or os.path.splitext(os.path.basename(path))[0]
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    window = window or DEFAULT_CONTEXT_WINDOW
+    return {"id": sid, "label": label or sid[:8], "tokens": tokens,
+            "window": window, "pct": min(100.0, tokens / window * 100.0),
+            "branch": branch or "", "mtime": mtime}
+
+
+def scan_local_sessions(root=None, limit=5, window=DEFAULT_CONTEXT_WINDOW,
+                        max_age=None):
+    """Newest-first context readings for the most recently touched transcripts.
+    `limit` caps how many files are actually parsed (they're big); `max_age`
+    (seconds) skips transcripts older than that. Best-effort throughout."""
+    root = root or claude_projects_dir()
+    try:
+        paths = []
+        for proj in os.scandir(root):
+            if not proj.is_dir():
+                continue
+            for f in os.scandir(proj.path):
+                if f.name.endswith(".jsonl") and f.is_file():
+                    try:
+                        paths.append((f.stat().st_mtime, f.path))
+                    except OSError:
+                        continue
+    except OSError:
+        return []
+    paths.sort(reverse=True)
+    if max_age:
+        cutoff = time.time() - max_age
+        paths = [p for p in paths if p[0] >= cutoff]
+    out = []
+    for _mtime, path in paths:
+        if len(out) >= limit:
+            break
+        rec = read_session_context(path, window)
+        if rec:
+            out.append(rec)
+    return out
+
+
+def fmt_tokens(n):
+    """Compact token count: 160391 → '160k'; 1_240_000 → '1.2M'."""
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def context_section(ctx):
+    """Context-window usage for the local Claude Code sessions. Reads only from
+    LIVE (populated on the extras clock in main()) so rendering never touches
+    the disk — the panel redraws several times a second."""
+    sessions = LIVE.get("context") or []
+    if not sessions:
+        return []
+    cols = ctx["cols"]
+    out = [_section("CONTEXT")]
+    # Two sessions in the same project would otherwise render identical labels.
+    dupes = {}
+    for s in sessions:
+        dupes[s.get("label")] = dupes.get(s.get("label"), 0) + 1
+    for s in sessions:
+        label = s.get("label") or s.get("id", "")[:8]
+        if dupes.get(s.get("label"), 0) > 1:
+            label = f"{label} {str(s.get('id') or '')[:4]}"
+        pct = float(s.get("pct") or 0.0)
+        right = f"{fmt_tokens(s.get('tokens'))}/{fmt_tokens(s.get('window'))}"
+        # label + bar + "  123k/200k" — the bar gets whatever's left over.
+        lw = min(14, max(6, cols - len(right) - 12))
+        bar_w = cols - lw - 1 - 1 - len(right)
+        line = f"{CREAM}{label[:lw]:<{lw}}{R}"
+        if bar_w >= 6:
+            line += f" {progress_bar(pct, bar_w)}"
+        out.append(f"{line} {rgb(*heat(pct))}{right}{R}")
+        bits = [fmt_pct(pct)]
+        if s.get("branch"):
+            bits.append(s["branch"])
+        ago = fmt_ago(datetime.fromtimestamp(
+            s["mtime"], timezone.utc).isoformat()) if s.get("mtime") else ""
+        if ago:
+            bits.append(ago)
+        out.append(f"  {DIM}{GREY}{' · '.join(bits)[:cols - 2]}{R}")
+    return out
+
+
 # status_bucket / worker_status → dot colour signalling liveness at a glance
 def _session_dot(sess):
     conn = sess.get("connection_status")
@@ -1373,6 +1563,7 @@ PANEL_SECTIONS = {
     "credits": credits_section,
     "extra_usage": extra_usage_section,
     "sessions": lambda ctx: sessions_section(ctx["cols"]),
+    "context": context_section,
     "recent": lambda ctx: recent_section(ctx["cols"]),
     "account": lambda ctx: account_section(ctx["cols"]),
     "connectors": lambda ctx: connectors_section(ctx["cols"]),
@@ -1381,7 +1572,8 @@ PANEL_SECTIONS = {
 
 # The default order — identical to the hardcoded layout it replaced.
 DEFAULT_SECTIONS = ("limits", "additional", "credits", "extra_usage",
-                    "sessions", "recent", "account", "connectors", "cowork")
+                    "context", "sessions", "recent", "account", "connectors",
+                    "cowork")
 
 # What survives the [s] "just the numbers" toggle.
 CORE_SECTIONS = ("limits", "additional", "credits", "extra_usage")
@@ -1935,6 +2127,12 @@ def main():
                     help="override where once-per-crossing state is stored")
     ap.add_argument("--theme", choices=sorted(THEMES), default=None,
                     help=f"color theme [{DEFAULT_THEME}]")
+    ap.add_argument("--context-window", type=int, default=None,
+                    help="assumed model context window in tokens "
+                         f"[{DEFAULT_CONTEXT_WINDOW}]")
+    ap.add_argument("--context-sessions", type=int, default=None,
+                    help="how many local Claude Code sessions to show in the "
+                         "CONTEXT section (0 = off) [3]")
     ap.add_argument("--trends", dest="trends", action="store_const",
                     const=True, default=None,
                     help="also draw the history trend sparkline under each "
@@ -1952,7 +2150,9 @@ def main():
            "alert_threshold": args.alert_threshold,
            "alert_notifier": args.alert_notifier,
            "alert_state_path": args.alert_state_path, "theme": args.theme,
-           "sections": args.sections, "trends": args.trends}
+           "sections": args.sections, "trends": args.trends,
+           "context_window": args.context_window,
+           "context_sessions": args.context_sessions}
     env = {"interval": os.environ.get("CLAUDE_USAGE_INTERVAL"),
            "extras_interval": os.environ.get("CLAUDE_USAGE_EXTRAS_INTERVAL"),
            "bootstrap_interval": os.environ.get("CLAUDE_USAGE_BOOTSTRAP_INTERVAL"),
@@ -1966,7 +2166,9 @@ def main():
            "alert_state_path": os.environ.get("CLAUDE_USAGE_ALERT_STATE_PATH"),
            "theme": os.environ.get("CLAUDE_USAGE_THEME"),
            "sections": os.environ.get("CLAUDE_USAGE_SECTIONS"),
-           "trends": os.environ.get("CLAUDE_USAGE_TRENDS")}
+           "trends": os.environ.get("CLAUDE_USAGE_TRENDS"),
+           "context_window": os.environ.get("CLAUDE_USAGE_CONTEXT_WINDOW"),
+           "context_sessions": os.environ.get("CLAUDE_USAGE_CONTEXT_SESSIONS")}
     cfg = resolve_runtime_config(cli, env, load_config())
     interval = cfg["interval"]
     extras_interval = cfg["extras_interval"]
@@ -2095,6 +2297,13 @@ def main():
             # Live extras — the lazy clock; manual [r] forces them too.
             if force or now - last_extra >= extras_interval:
                 LIVE = fetch_live(cookie, org)  # best-effort; may hold Nones
+                # Local transcripts, same lazy clock: cheap, but it's disk I/O,
+                # so it must not happen on the 0.3s redraw tick.
+                if cfg["context_sessions"]:
+                    LIVE["context"] = scan_local_sessions(
+                        limit=cfg["context_sessions"],
+                        window=cfg["context_window"],
+                        max_age=cfg["context_max_age"] or None)
                 last_extra = now
             # Bootstrap — once at startup unless a refresh interval was set.
             if bootstrap_interval and now - last_boot >= bootstrap_interval:
