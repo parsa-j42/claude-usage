@@ -1158,6 +1158,170 @@ def test_primary_metrics_carries_kind(mod):
                                                            "seven_day"}
 
 
+# ── Context-window usage from local Claude Code transcripts ───────────
+
+def _write_transcript(path, usage, cwd="/home/u/proj", branch="main",
+                      sid="abcd1234-0000", pad=0):
+    """A miniature Claude Code transcript: some noise, optional padding to push
+    the head out of the tail window, then an assistant record carrying usage."""
+    import json as _json
+    with open(path, "w") as fh:
+        fh.write(_json.dumps({"type": "custom-title", "sessionId": sid,
+                              "customTitle": "Fancy Title"}) + "\n")
+        for i in range(pad):
+            fh.write(_json.dumps({"type": "system", "text": "x" * 400,
+                                  "n": i}) + "\n")
+        fh.write(_json.dumps({"type": "user", "cwd": cwd, "sessionId": sid,
+                              "gitBranch": branch}) + "\n")
+        if usage is not None:
+            fh.write(_json.dumps({"type": "assistant", "cwd": cwd,
+                                  "sessionId": sid, "gitBranch": branch,
+                                  "message": {"model": "claude-opus-5",
+                                              "usage": usage}}) + "\n")
+
+
+USAGE = {"input_tokens": 2, "cache_creation_input_tokens": 743,
+         "cache_read_input_tokens": 159646, "output_tokens": 157}
+
+
+def test_context_tokens(mod):
+    """Cached tokens still occupy the window; output tokens do not."""
+    assert mod.context_tokens(USAGE) == 2 + 743 + 159646
+    assert mod.context_tokens({"input_tokens": 10}) == 10
+    # Missing counters are tolerated; a block with none of them is unusable.
+    assert mod.context_tokens({"output_tokens": 5}) is None
+    assert mod.context_tokens({}) is None
+    assert mod.context_tokens(None) is None
+    assert mod.context_tokens("nope") is None
+    assert mod.context_tokens({"input_tokens": True}) is None  # bool ≠ count
+
+
+def test_read_session_context(mod):
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "abcd1234-0000.jsonl")
+        _write_transcript(path, USAGE)
+        rec = mod.read_session_context(path, window=200_000)
+        assert rec["tokens"] == 160391
+        assert abs(rec["pct"] - 80.1955) < 0.01
+        assert rec["label"] == "proj"          # cwd basename, not the title
+        assert rec["branch"] == "main"
+        assert rec["id"] == "abcd1234-0000"
+        # A transcript with no usage record yields nothing rather than a zero.
+        empty = os.path.join(d, "empty.jsonl")
+        _write_transcript(empty, None)
+        assert mod.read_session_context(empty) is None
+        # Unreadable / absent files are skipped, not fatal.
+        assert mod.read_session_context(os.path.join(d, "nope.jsonl")) is None
+        # Garbage lines don't stop the scan.
+        junk = os.path.join(d, "junk.jsonl")
+        with open(junk, "a") as fh:
+            fh.write("{not json\n")
+        _write_transcript(junk, USAGE)
+        assert mod.read_session_context(junk)["tokens"] == 160391
+
+
+def test_read_session_context_tail_only(mod):
+    """Transcripts run to megabytes, so only the tail is parsed — the reading
+    must still be correct when the head is far outside the window."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "big.jsonl")
+        _write_transcript(path, USAGE, pad=3000)   # ≫ CONTEXT_TAIL_BYTES
+        assert os.path.getsize(path) > mod.CONTEXT_TAIL_BYTES
+        rec = mod.read_session_context(path)
+        assert rec is not None and rec["tokens"] == 160391
+        assert rec["label"] == "proj"
+
+
+def test_context_pct_is_capped(mod):
+    """A window smaller than the reading can't produce a >100% bar."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "s.jsonl")
+        _write_transcript(path, USAGE)
+        assert mod.read_session_context(path, window=1000)["pct"] == 100.0
+
+
+def test_scan_local_sessions(mod):
+    import tempfile
+    with tempfile.TemporaryDirectory() as root:
+        for i, name in enumerate(("proj-a", "proj-b")):
+            os.makedirs(os.path.join(root, name))
+            for j in range(2):
+                pth = os.path.join(root, name, f"sess{i}{j}-1111.jsonl")
+                _write_transcript(pth, dict(USAGE, input_tokens=i * 10 + j),
+                                  cwd=f"/home/u/{name}", sid=f"sess{i}{j}-1111")
+                os.utime(pth, (1_700_000_000 + i * 10 + j,) * 2)
+        out = mod.scan_local_sessions(root, limit=10)
+        assert len(out) == 4
+        # Newest first.
+        assert [r["mtime"] for r in out] == sorted(
+            (r["mtime"] for r in out), reverse=True)
+        assert {r["label"] for r in out} == {"proj-a", "proj-b"}
+        # `limit` caps how many files are parsed at all.
+        assert len(mod.scan_local_sessions(root, limit=2)) == 2
+        # `max_age` drops stale transcripts (these are from 2023).
+        assert mod.scan_local_sessions(root, limit=10, max_age=60) == []
+        # A missing root is empty, not an error.
+        assert mod.scan_local_sessions(os.path.join(root, "gone")) == []
+
+
+def test_fmt_tokens(mod):
+    assert mod.fmt_tokens(0) == "0"
+    assert mod.fmt_tokens(999) == "999"
+    assert mod.fmt_tokens(160391) == "160k"
+    assert mod.fmt_tokens(1_240_000) == "1.2M"
+    assert mod.fmt_tokens(None) == "0"
+
+
+def test_context_section_renders(mod):
+    mod.LIVE = {"context": [
+        {"id": "aaaa1111", "label": "proj", "tokens": 160391, "window": 200000,
+         "pct": 80.2, "branch": "main", "mtime": 0},
+        {"id": "bbbb2222", "label": "proj", "tokens": 20000, "window": 200000,
+         "pct": 10.0, "branch": "", "mtime": 0},
+    ]}
+    try:
+        lines = _strip(mod.context_section(mod._panel_ctx({}, 72)))
+        assert lines[0].strip() == "CONTEXT"
+        assert "160k/200k" in lines[1] and "80%" in lines[2]
+        # Identical project names are disambiguated by session id.
+        assert lines[1].startswith("proj aaaa") and lines[3].startswith("proj bbbb")
+        for l in lines:
+            assert len(l) <= 72, l
+        # Narrow panels drop the bar rather than overflowing.
+        for cols in (46, 52, 60, 100):
+            for l in _strip(mod.context_section(mod._panel_ctx({}, cols))):
+                assert len(l) <= cols, (cols, l)
+    finally:
+        mod.LIVE = {}
+
+
+def test_context_section_is_empty_without_live_data(mod):
+    """Rendering never touches the disk — the panel redraws several times a
+    second, so the scan happens on the extras clock in main() instead."""
+    mod.LIVE = {}
+    assert mod.context_section(mod._panel_ctx({}, 80)) == []
+    mod.LIVE = {"context": []}
+    assert mod.context_section(mod._panel_ctx({}, 80)) == []
+
+
+def test_context_settings_precedence(mod):
+    rc = mod.resolve_runtime_config
+    d = rc({}, {}, {})
+    assert d["context_window"] == mod.DEFAULT_CONTEXT_WINDOW
+    assert d["context_sessions"] == 3
+    assert d["context_max_age"] == 24 * 3600
+    assert rc({}, {}, {"context_window": 1_000_000})["context_window"] == 1_000_000
+    assert rc({}, {"context_sessions": "5"}, {})["context_sessions"] == 5
+    # 0 sessions is a meaningful "off", not "unset".
+    assert rc({}, {}, {"context_sessions": 0})["context_sessions"] == 0
+    # Garbage falls through to the default rather than crashing the loop.
+    assert rc({}, {}, {"context_window": "junk"})["context_window"] == \
+        mod.DEFAULT_CONTEXT_WINDOW
+
+
 def main():
     mod = load_module()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

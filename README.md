@@ -34,6 +34,8 @@ with your existing browser session cookie — no API key, nothing to configure.
 - **Everything the API exposes.** Session/weekly limits, model-scoped limits,
   credits and spend, extra usage, plus account, connectors/MCP, cowork status,
   live code sessions, and recent chats (large windows only).
+- **Context window per session.** How full each of your local Claude Code
+  sessions is, read straight from its transcript — no network involved.
 - **Pace at a glance.** Every limit bar carries a tick showing how much of the
   reset window has elapsed, so "am I burning too fast?" is a length comparison,
   not arithmetic. Needs no history — it's there on the first frame.
@@ -113,6 +115,8 @@ put a lasting choice in the config file (`theme`, `sections`).
 | `--theme`              | `claude`| Color theme: `claude`, `cool`, `mono`, `contrast`.  |
 | `--sections`           | all     | Panel sections to show, in order (comma-separated). |
 | `--trends`             | off     | Also draw the history trend sparklines.             |
+| `--context-window`     | `200000`| Assumed context window for the CONTEXT section.     |
+| `--context-sessions`   | `3`     | Local sessions in the CONTEXT section (0 = off).    |
 
 ## History & headless mode
 
@@ -206,6 +210,42 @@ The default is unchanged from before themes existed — byte for byte, and there
 a test pinning it to a golden hash so it stays that way. An unrecognized theme
 name falls back to the default rather than refusing to start.
 
+## Context window per session
+
+The `CONTEXT` section shows how full each of your recent **local Claude Code
+sessions** is:
+
+```
+CONTEXT
+usage-tracker  ████████████████████████████████████████░░░░░░░ 170k/200k
+  85% · gitbutler/workspace · just now
+Yekta 6dd7     ████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 83k/200k
+  42% · gitbutler/workspace · 2m ago
+```
+
+This reads Claude Code's own transcripts under `~/.claude/projects/` (honoring
+`CLAUDE_CONFIG_DIR`) — **no network, no cookie**. The number is the last
+`message.usage` record in each transcript:
+
+```
+input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+```
+
+Cached tokens still occupy the window, so they count; `output_tokens` is the
+reply rather than the prompt, so it doesn't. Transcripts run to megabytes, so
+only the last 256 KB of each is parsed, and only the newest few files are opened
+at all — a scan takes a handful of milliseconds. It refreshes on the extras
+clock (`--extras-interval`), never on the redraw tick.
+
+Sessions are labeled by project directory, disambiguated with a short session id
+when one project has several. Set `--context-sessions 0` (or hide the `context`
+section) to turn it off.
+
+> The window size is assumed, not discovered — the transcript records tokens
+> used, not the model's limit. Set `--context-window` if you're on a model with
+> a different one. `context_max_age` (config-only, default 86400s) ignores
+> transcripts that haven't been touched recently.
+
 ## Panel sections
 
 The big panel (≥46×20) is composed from named sections. By default all of them
@@ -217,6 +257,7 @@ render, in this order:
 | `additional`   | Model-scoped / cowork / host buckets, when present      |
 | `credits`      | Spend, balance, cap, credit toggles                     |
 | `extra_usage`  | Extra-usage status and utilization, when present        |
+| `context`      | Context-window usage of local Claude Code sessions       |
 | `sessions`     | Live code sessions                                      |
 | `recent`       | Recent chats                                            |
 | `account`      | Name, org, rate tier, billing                           |
@@ -296,6 +337,11 @@ org = "your-org-uuid"
 theme = "claude"         # claude | cool | mono | contrast
 
 trends = false           # opt in to the history trend sparklines
+
+# Context window usage of local Claude Code sessions
+context_window = 200000    # assumed model context window, in tokens
+context_sessions = 3       # how many sessions to show (0 = off)
+context_max_age = 86400    # ignore transcripts untouched for longer than this
 
 # Big-panel sections: which blocks show, and in what order. Omit the key for
 # all of them in the default order. Unknown names are ignored.
